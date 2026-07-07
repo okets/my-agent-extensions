@@ -1,0 +1,26 @@
+# Private-data guardrails for the public my-agent-extensions repo.
+#
+# The blocking pre-commit hook (scripts/pre-commit) rejects any staged line matching these
+# patterns (grep -E). They are CLASSES of secrets / deployment identifiers — high-signal, low
+# false-positive. Never commit real credentials, tokens, or deployment-specific network/host
+# identifiers. If you authored a connector on your own machine, sanitize it first (see
+# CONTRIBUTING.md).
+#
+# One pattern per line; lines starting with # are comments.
+
+# Secret / API key material
+sk-ant-[A-Za-z0-9_-]{20,}
+AKIA[0-9A-Z]{16}
+gh[pousr]_[A-Za-z0-9]{20,}
+xox[baprs]-[A-Za-z0-9-]{10,}
+-----BEGIN [A-Z ]*PRIVATE KEY-----
+
+# Deployment / private network identifiers
+\.ts\.net
+\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b
+\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b
+\b100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b
+
+# Absolute home paths (leak a username / machine layout)
+/home/[A-Za-z0-9._-]+/
+/Users/[A-Za-z0-9._-]+/

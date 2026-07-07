@@ -1,0 +1,14 @@
+{
+  "name": "whatsapp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-contained WhatsApp (Baileys) transport connector — generic drop-in path.",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@whiskeysockets/baileys": "7.0.0-rc13",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4",
+    "tsx": "^4.22.3"
+  }
+}

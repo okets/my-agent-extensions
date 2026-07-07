@@ -1,0 +1,42 @@
+{
+  "name": "my-agent-transport-kit",
+  "version": "0.1.0",
+  "description": "Conformance harness, wire-protocol types, and manifest validator for authoring my-agent transport connectors. Certify a connector folder in a clean directory — no framework checkout required.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "my-agent-transport-kit": "dist/cli.js"
+  },
+  "main": "dist/lib.js",
+  "types": "dist/lib.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/lib.d.ts",
+      "import": "./dist/lib.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node build.mjs && node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "marked": "^18.0.4",
+    "yaml": "^2.8.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.2",
+    "esbuild": "^0.25.0",
+    "typescript": "^6.0.3"
+  }
+}

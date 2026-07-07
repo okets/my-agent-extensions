@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Blocking pre-commit hook for my-agent-extensions. Rejects staged content matching a
+# private-data pattern in .guardrails (secrets, tokens, deployment/network identifiers,
+# absolute home paths). Enable after cloning:
+#
+#   git config core.hooksPath scripts
+#
+# Bypass (emergency only, if a pattern false-positives): git commit --no-verify
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+GUARDRAILS="$REPO_ROOT/.guardrails"
+[ -f "$GUARDRAILS" ] || exit 0
+
+# Only added lines (leading +, excluding the +++ file header).
+STAGED_ADDED="$(git diff --cached --diff-filter=d -U0 | grep -E '^\+[^+]' || true)"
+[ -z "$STAGED_ADDED" ] && exit 0
+
+FAILED=0
+while IFS= read -r pattern; do
+  [[ -z "$pattern" || "$pattern" == \#* ]] && continue
+  if printf '%s\n' "$STAGED_ADDED" | grep -qE "$pattern" 2>/dev/null; then
+    # Report the offending files (skip .guardrails itself — it holds the patterns by design).
+    matched="$(git diff --cached --diff-filter=d --name-only | while read -r f; do
+      [ "$f" = ".guardrails" ] && continue
+      git diff --cached -U0 -- "$f" | grep -E '^\+[^+]' | grep -qE "$pattern" 2>/dev/null && echo "    $f"
+    done)"
+    if [ -n "$matched" ]; then
+      echo "BLOCKED: private-data pattern in staged content:"
+      echo "  pattern: $pattern"
+      echo "  files:"
+      echo "$matched"
+      echo ""
+      FAILED=1
+    fi
+  fi
+done < "$GUARDRAILS"
+
+if [ "$FAILED" -eq 1 ]; then
+  echo "Commit rejected. Remove secrets / deployment identifiers before committing."
+  echo "Bypass (emergency only): git commit --no-verify"
+  exit 1
+fi
+exit 0
