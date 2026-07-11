@@ -17,6 +17,15 @@ upstream: socket
 upstream_self_window_ms: 60000
 # M10-S9.9: simple-icons slug for the dashboard health-icon (monochrome brand glyph).
 icon: whatsapp
+# Post-hatch concierge menu metadata — the honest pool-connector line the
+# break-in menu renders. REQUIRED for pool membership (missing → cert failure).
+menu:
+  label: "WhatsApp"
+  description: "Chat with me on WhatsApp — messages, photos, voice notes."
+  requirements:
+    - "Your WhatsApp on your phone to scan a pairing code (like WhatsApp Web; no extra account)"
+  effort: "a few minutes, guided — we do it together right now"
+  impact: 0
 requires:
   env:
     - WHATSAPP_PHONE_NUMBER
