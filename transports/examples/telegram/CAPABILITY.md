@@ -16,6 +16,14 @@ upstream: poll
 upstream_self_window_ms: 150000
 # M10-S9.9: simple-icons slug for the dashboard health-icon (monochrome brand glyph).
 icon: telegram
+# Post-hatch concierge menu metadata — the honest pool-connector line the
+# break-in menu renders. REQUIRED for pool membership (missing → cert failure).
+menu:
+  description: "Chat with me on Telegram — messages, photos, voice notes."
+  requirements:
+    - "A Telegram account and a free bot token from @BotFather (I'll walk you through it)"
+  effort: "a few minutes, guided — we do it together right now"
+  impact: 0
 requires:
   env:
     - TELEGRAM_BOT_TOKEN

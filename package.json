@@ -1,0 +1,12 @@
+{
+  "name": "my-agent-extensions",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "index": "node scripts/generate-index.mjs",
+    "index:check": "node scripts/generate-index.mjs --check"
+  },
+  "devDependencies": {
+    "yaml": "^2.6.0"
+  }
+}
