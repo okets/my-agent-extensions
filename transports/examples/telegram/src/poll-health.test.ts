@@ -53,6 +53,20 @@ eq(
   { upstreamConnected: false, reason: 'logged_out' },
 )
 
+// ── TERMINAL: the one-shot startup getMe probe said the token is invalid/incomplete (401/404) ────────
+// reason:'credential', NEVER 'network' — a recycle respawns into the identical death; a human must
+// re-supply the secret (the 2026-07-11 walkthrough's 40-minute silent spawn-die loop).
+eq(
+  'credential invalid → false + reason:credential (terminal, never network)',
+  computePollHealth({ certRun: false, liveStarted: true, loggedOut: false, credentialInvalid: true, lastSuccessfulGetUpdatesAt: 0, now: NOW }),
+  { upstreamConnected: false, reason: 'credential' },
+)
+eq(
+  'cert run wins over a credential latch (the probe never runs in ECHO/cert — synthetic up holds)',
+  computePollHealth({ certRun: true, liveStarted: false, loggedOut: false, credentialInvalid: true, lastSuccessfulGetUpdatesAt: 0, now: NOW }),
+  { upstreamConnected: true, lastUpstreamActivityMs: NOW },
+)
+
 // ── NOT YET ARMED: poll still in the post-handshake grace → honest up (nothing has failed) ───────────
 eq(
   'poll not yet armed → up + fresh now ts (no cadence to be stale against yet)',

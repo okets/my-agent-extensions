@@ -726,6 +726,12 @@ let deferredPollTimer: ReturnType<typeof setTimeout> | null = null
 // latches a hard 401 (token revoked) — terminal, so the framework pages rather than spins (Invariant 5).
 let lastSuccessfulGetUpdatesAt = 0
 let pollLoggedOut = false
+// Credential probe: latches when the ONE-SHOT startup getMe probe returns 401/404 — the token is
+// invalid or incomplete (e.g. a half-copied BotFather token). TERMINAL: fed to transport/health as
+// reason:'credential' (never 'network' — a recycle respawns into the identical death) and paged
+// ONCE via needs_attention with a plain-language message. Probed exactly once per process start —
+// never retry-looped.
+let credentialInvalid = false
 // 2a.4 (2): ms-epoch of the most recent getUpdates 409 conflict (another poller active — the OLD
 // child during a supervised deploy restart). Fed to transport/health so a would-be-stale poll is
 // reported transient (defer) within the settle-grace, not network (which would self-recycle a
@@ -743,15 +749,50 @@ function noteLoopback(): void {
   }
 }
 
+/** ONE-SHOT startup credential probe (LIVE mode only — never runs in ECHO/cert). getMe is the
+ *  cheapest authenticated call: a 401 (unauthorized) or 404 (malformed/incomplete token — the
+ *  BotFather half-copy) is TERMINAL. Latch `credentialInvalid` so transport/health reports
+ *  reason:'credential' (a human must re-supply the secret) and page ONCE via needs_attention with
+ *  a plain-language message. Any other outcome (2xx, 5xx, network error) is NOT a credential
+ *  verdict — the poll loop's own backoff/staleness handles those. Runs exactly once per process
+ *  start; never retry-looped. */
+async function probeCredentialOnce(): Promise<void> {
+  try {
+    const resp = await fetch(TG('getMe'), { method: 'POST' })
+    if (resp.status === 401 || resp.status === 404) {
+      credentialInvalid = true
+      console.warn(
+        `[telegram] getMe ${resp.status} — the bot token is invalid or incomplete; paging needs_attention (credential) and not arming the poll (terminal)`,
+      )
+      void mcp
+        .notification({
+          method: NEEDS_ATTENTION,
+          params: { reason: 'credential', detail: 'the bot token is invalid or incomplete' },
+        })
+        .catch(() => {})
+    }
+  } catch {
+    // Network error ≠ credential verdict — never latch terminal on an environmental failure.
+  }
+}
+
 function startLivePolling(): void {
   if (liveStarted || conformanceSeen || ECHO_MODE) return
   liveStarted = true
   // B4: anchor the cadence clock at arm-time so transport/health doesn't read a freshly-armed poll as
   // instantly stale before the first getUpdates returns (a long-poll cycle can take up to the timeout).
   lastSuccessfulGetUpdatesAt = Date.now()
-  // Telegram rejects getUpdates while a webhook is set; clear it so long-polling works.
-  void fetch(TG('deleteWebhook'), { method: 'POST' }).catch(() => {})
-  void pollLoop()
+  void (async () => {
+    // Credential probe FIRST (one getMe per process start): a 401/404 verdict is terminal — do NOT
+    // arm the poll (getUpdates would only re-die on the same bad token, the silent recycle loop this
+    // probe exists to kill) and do NOT clear the webhook. needs_attention has already paged;
+    // transport/health now answers reason:'credential'.
+    await probeCredentialOnce()
+    if (credentialInvalid) return
+    // Telegram rejects getUpdates while a webhook is set; clear it so long-polling works.
+    void fetch(TG('deleteWebhook'), { method: 'POST' }).catch(() => {})
+    void pollLoop()
+  })()
 }
 
 // ── MCP server ──────────────────────────────────────────────────────────────────────────────
@@ -915,6 +956,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       certRun: ECHO_MODE || conformanceSeen,
       liveStarted,
       loggedOut: pollLoggedOut,
+      credentialInvalid, // one-shot startup getMe verdict — terminal 'credential', never 'network'
       lastSuccessfulGetUpdatesAt,
       last409At, // 2a.4 (2): the settle-guard input
       now: Date.now(),

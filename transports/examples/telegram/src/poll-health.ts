@@ -35,8 +35,9 @@
 
 /** Down-classification, mirroring `HealthToolOutput.reason` in the framework wire-protocol:
  *  'transient' (recoverable in-band drop), 'logged_out' (terminal — needs a human re-pair, do NOT
- *  spin reconnect), 'network' (environmental — recoverable). */
-export type HealthReason = 'transient' | 'logged_out' | 'network'
+ *  spin reconnect), 'credential' (terminal — the stored token is invalid or incomplete; a human
+ *  must re-supply the secret, do NOT recycle-loop), 'network' (environmental — recoverable). */
+export type HealthReason = 'transient' | 'logged_out' | 'credential' | 'network'
 
 /** Matches the framework `HealthToolOutput` shape the connector returns on the wire. */
 export interface HealthReport {
@@ -90,6 +91,11 @@ export interface PollHealthInput {
   liveStarted: boolean
   /** A hard 401 from getUpdates was seen — terminal (token revoked; needs a human re-pair). */
   loggedOut: boolean
+  /** The ONE-SHOT startup getMe probe returned 401/404 — the token is invalid or incomplete
+   *  (e.g. a half-copied BotFather token). TERMINAL: a fresh process with the same token dies the
+   *  same way, so the verdict must be `credential`, never `network` (which would recycle-loop).
+   *  Distinct from `loggedOut` (a previously-working token revoked mid-run). */
+  credentialInvalid?: boolean
   /** ms-epoch of the last 2xx getUpdates (anchored at arm-time); 0 = never. */
   lastSuccessfulGetUpdatesAt: number
   /**
@@ -118,6 +124,16 @@ export function computePollHealth(input: PollHealthInput): HealthReport {
 
   // CERT-RUN affordance (CRIES-WOLF): no live poll, but the connector IS up and serving the harness.
   if (certRun) return { upstreamConnected: true, lastUpstreamActivityMs: now }
+
+  // TERMINAL: the one-shot startup credential probe said the token is invalid or incomplete
+  // (getMe 401/404). NEVER 'network' — a recycle respawns into the identical death; a human must
+  // re-supply the secret. Reported before every other live verdict: with a bad token no other
+  // upstream signal is meaningful.
+  if (input.credentialInvalid) {
+    const report: HealthReport = { upstreamConnected: false, reason: 'credential' }
+    if (lastSuccessfulGetUpdatesAt > 0) report.lastUpstreamActivityMs = lastSuccessfulGetUpdatesAt
+    return report
+  }
 
   // TERMINAL: a hard 401 — the bot token is revoked/unauthorized. A human must re-pair; the framework
   // pages (needs_attention) and must NOT spin reconnect (Invariant 5).
