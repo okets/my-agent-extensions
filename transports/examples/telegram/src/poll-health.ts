@@ -167,3 +167,19 @@ export function computePollHealth(input: PollHealthInput): HealthReport {
   // UP: a recent successful getUpdates within the cadence window.
   return { upstreamConnected: true, lastUpstreamActivityMs: lastSuccessfulGetUpdatesAt }
 }
+
+/** Cursor-regression tripwire (2026-07-11 live incident) — pure decision; wired in server.ts drain().
+ *
+ *  With a GENUINE durable cursor, every update the poll buffers has update_id > cursor (the poll
+ *  offset only advances past framework-acknowledged updates, so Telegram never re-returns them).
+ *  A drain that matches NOTHING while the backlog is non-empty — and nothing has EVER drained in
+ *  this process — therefore means the framework's cursor belongs to a DIFFERENT update-id space:
+ *  a cursor inherited across a bot swap (new token → new bot → new id range) or a corrupted store.
+ *  Without this tripwire the stall is perfectly silent behind a green health dot (a poisoned
+ *  cursor filtered 100% of live inbound for 4+ hours in the 2026-07-11 walkthrough).
+ *
+ *  `everReturned` guards the legitimate quiet case: after a successful drain the backlog keeps
+ *  already-returned entries in memory, so a later no-new-work drain matching 0 is normal. */
+export function isCursorRegression(input: { returnedNow: number; backlogSize: number; everReturned: boolean }): boolean {
+  return input.returnedNow === 0 && input.backlogSize > 0 && !input.everReturned
+}

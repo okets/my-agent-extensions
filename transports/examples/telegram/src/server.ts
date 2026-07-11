@@ -47,7 +47,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 // B4: the pure poll-staleness verdict for transport/health (dependency-free; unit-tested as a tsx
 // script — see poll-health.test.ts). The long-poll timeout is sourced from here too (single source).
-import { computePollHealth, LONG_POLL_TIMEOUT_S, shouldLatchConformanceSeen } from './poll-health.js'
+import { computePollHealth, isCursorRegression, LONG_POLL_TIMEOUT_S, shouldLatchConformanceSeen } from './poll-health.js'
 
 // ── Wire strings (inlined — never import a framework module) ──────────────────────────────
 const SEND_TOOL = 'transport/send'
@@ -106,6 +106,12 @@ const API_BASE = process.env.TELEGRAM_API_BASE ?? 'https://api.telegram.org'
 // explicit override is set. The poll loop / startup deleteWebhook are gated on this — they only run
 // in genuine LIVE mode (a real token present).
 const ECHO_MODE = !token || process.env.TELEGRAM_ECHO === '1'
+// CONFORMANCE_MODE — the authoritative cert-run signal set by the conformance harness
+// (TRANSPORT_CONFORMANCE=1). The live auto-wire path NEVER sets it. Cert-ness derives from THIS
+// flag ONLY — never from message/target shape — so a live send to a non-deliverable target can no
+// longer poison (latch off) the live poll loop (2026-07-11 live fix: a shape-inferred latch
+// silently disarmed the long-poll while health reported a synthetic "up").
+const CONFORMANCE_MODE = process.env.TRANSPORT_CONFORMANCE === '1'
 
 // A DELIVERABLE Telegram target is a numeric chat_id (a DM's chat==sender id) or an `@username`.
 // The conformance harness drives the connector entirely through synthetic targets (e.g. `to:'probe'`)
@@ -457,6 +463,7 @@ async function ingest(updates: TelegramUpdate[]): Promise<number> {
   let added = 0
   for (const u of updates) {
     if (u.update_id <= localHighestSeen) continue // already seen — Telegram re-returned it
+    inboundReceived++
 
     // ── Reaction (M10-S9) ──────────────────────────────────────────────────────────────────
     if (u.message_reaction) {
@@ -531,6 +538,7 @@ async function ingest(updates: TelegramUpdate[]): Promise<number> {
     }
     localHighestSeen = u.update_id
   }
+  inboundEnqueued += added
   return added
 }
 
@@ -541,6 +549,19 @@ function drain(sinceCursor: string | null): WireInbound[] {
   const out = backlog
     .filter((m) => Number(m.cursor) > after)
     .sort((a, b) => Number(a.cursor) - Number(b.cursor))
+  if (out.length > 0) everReturnedEntries = true
+  else if (
+    isCursorRegression({ returnedNow: out.length, backlogSize: backlog.length, everReturned: everReturnedEntries }) &&
+    after !== lastRegressionWarnAfter
+  ) {
+    lastRegressionWarnAfter = after
+    console.warn(
+      `[telegram] CURSOR REGRESSION SUSPECTED: drain(sinceCursor=${sinceCursor}) matched 0 of ` +
+        `${backlog.length} buffered update(s) and nothing has ever drained this process — the durable ` +
+        `cursor appears to come from a DIFFERENT bot/update-id space (e.g. inherited across a bot ` +
+        `swap). Inbound is stalled until the framework's cursor store for this transport is reset.`,
+    )
+  }
   const maxReturned = out.length > 0 ? Number(out[out.length - 1].cursor) : Number.NEGATIVE_INFINITY
   const candidate = Math.max(lastDrainedCursor ?? Number.NEGATIVE_INFINITY, after, maxReturned)
   if (candidate !== Number.NEGATIVE_INFINITY) lastDrainedCursor = candidate
@@ -732,6 +753,17 @@ let pollLoggedOut = false
 // ONCE via needs_attention with a plain-language message. Probed exactly once per process start —
 // never retry-looped.
 let credentialInvalid = false
+// Divergence-net counters (2a-ii Telegram parity, 2026-07-11): the framework's inbound
+// divergence net ("connector reports traffic arriving but nothing drained") is BLIND unless the
+// connector self-reports these. `inboundReceived` = genuinely new updates seen by the poll
+// (post de-dup); `inboundEnqueued` = entries actually buffered for drain. Reported via
+// transport/health so a silent inbound stall (e.g. a poisoned cursor) pages instead of hiding
+// behind a green dot.
+let inboundReceived = 0
+let inboundEnqueued = 0
+// Cursor-regression tripwire state (see poll-health.ts isCursorRegression).
+let everReturnedEntries = false
+let lastRegressionWarnAfter: number | null = null
 // 2a.4 (2): ms-epoch of the most recent getUpdates 409 conflict (another poller active — the OLD
 // child during a supervised deploy restart). Fed to transport/health so a would-be-stale poll is
 // reported transient (defer) within the settle-grace, not network (which would self-recycle a
@@ -739,6 +771,10 @@ let credentialInvalid = false
 let last409At = 0
 
 function noteLoopback(): void {
+  // Cert-ness derives ONLY from the authoritative TRANSPORT_CONFORMANCE flag — never from target
+  // shape. In LIVE mode a send to a non-deliverable target must NOT latch conformanceSeen (that
+  // was the poll-poisoning bug: a live non-deliverable send disarmed the long-poll forever).
+  if (!CONFORMANCE_MODE) return
   // 2a-ii latch guard (architect gate, M10-S9.10) — see poll-health.ts's shouldLatchConformanceSeen
   // for the full contract. Pure decision, thin wiring here.
   if (!shouldLatchConformanceSeen(liveStarted)) return
@@ -777,7 +813,7 @@ async function probeCredentialOnce(): Promise<void> {
 }
 
 function startLivePolling(): void {
-  if (liveStarted || conformanceSeen || ECHO_MODE) return
+  if (liveStarted || conformanceSeen || ECHO_MODE || CONFORMANCE_MODE) return
   liveStarted = true
   // B4: anchor the cadence clock at arm-time so transport/health doesn't read a freshly-armed poll as
   // instantly stale before the first getUpdates returns (a long-poll cycle can take up to the timeout).
@@ -887,6 +923,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       // handles JSON-only with their ids INTACT (the carry-fidelity `images` probe matches on id) —
       // NO endpoint call, NO bytes: §1 holds, and re-staging would change the id and fail the probe.
       noteLoopback() // a loopback send proves this is a cert run, not live → disarm the long-poll
+      inboundEnqueued++
       backlog.push({
         cursor: String(++echoSeq),
         from: to,
@@ -961,11 +998,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       last409At, // 2a.4 (2): the settle-guard input
       now: Date.now(),
     })
+    // Divergence-net counters ride the same report (additive fields — the framework treats
+    // their absence as "connector opted out", so shipping them ARMS the net).
+    const reportWithCounters = { ...report, inboundReceived, inboundEnqueued }
     // Return BOTH structuredContent and a JSON text block (the framework reads structuredContent
     // first, then falls back to parsing the text block — SDK-shape resilient).
     return {
-      structuredContent: report as unknown as Record<string, unknown>,
-      content: [{ type: 'text', text: JSON.stringify(report) }],
+      structuredContent: reportWithCounters as unknown as Record<string, unknown>,
+      content: [{ type: 'text', text: JSON.stringify(reportWithCounters) }],
     }
   }
 
@@ -1027,7 +1067,7 @@ async function pollLoop(): Promise<void> {
 }
 
 await mcp.connect(new StdioServerTransport())
-if (!ECHO_MODE) {
+if (!ECHO_MODE && !CONFORMANCE_MODE) {
   // Defer the live long-poll until shortly AFTER the MCP handshake. The conformance harness drives
   // a loopback send immediately after connecting, which disarms this timer (noteLoopback) — so a
   // cert run, even in an env that carries the live token, never calls api.telegram.org and can't
