@@ -16,7 +16,7 @@
  * poll-staleness decision (the never-lie contract the A4 conformance probe enforces) + the cert-run
  * CRIES-WOLF affordance + the terminal-vs-environmental split (Invariant 5).
  */
-import { computePollHealth, POLL_STALE_WINDOW_MS, SETTLE_GRACE_MS, LONG_POLL_TIMEOUT_S, shouldLatchConformanceSeen } from './poll-health.js'
+import { computePollHealth, isCursorRegression, POLL_STALE_WINDOW_MS, SETTLE_GRACE_MS, LONG_POLL_TIMEOUT_S, shouldLatchConformanceSeen } from './poll-health.js'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
@@ -51,6 +51,20 @@ eq(
   'hard 401 before any success → false + reason:logged_out, no meaningless 0 ts',
   computePollHealth({ certRun: false, liveStarted: true, loggedOut: true, lastSuccessfulGetUpdatesAt: 0, now: NOW }),
   { upstreamConnected: false, reason: 'logged_out' },
+)
+
+// ── TERMINAL: the one-shot startup getMe probe said the token is invalid/incomplete (401/404) ────────
+// reason:'credential', NEVER 'network' — a recycle respawns into the identical death; a human must
+// re-supply the secret (the 2026-07-11 walkthrough's 40-minute silent spawn-die loop).
+eq(
+  'credential invalid → false + reason:credential (terminal, never network)',
+  computePollHealth({ certRun: false, liveStarted: true, loggedOut: false, credentialInvalid: true, lastSuccessfulGetUpdatesAt: 0, now: NOW }),
+  { upstreamConnected: false, reason: 'credential' },
+)
+eq(
+  'cert run wins over a credential latch (the probe never runs in ECHO/cert — synthetic up holds)',
+  computePollHealth({ certRun: true, liveStarted: false, loggedOut: false, credentialInvalid: true, lastSuccessfulGetUpdatesAt: 0, now: NOW }),
+  { upstreamConnected: true, lastUpstreamActivityMs: NOW },
 )
 
 // ── NOT YET ARMED: poll still in the post-handshake grace → honest up (nothing has failed) ───────────
@@ -173,8 +187,22 @@ eq(
   false,
 )
 
+// ── Cursor-regression tripwire (2026-07-11 poisoned-cursor incident) ───────────────────────────────
+// A durable cursor from a DIFFERENT bot/update-id space filters 100% of live inbound forever —
+// perfectly silent behind a green dot. The tripwire fires only in the never-drained-anything case,
+// so the normal already-returned-entries-linger-in-backlog quiet drain stays quiet.
+eq('poisoned cursor: 0 matched, backlog full, never drained → fires',
+  isCursorRegression({ returnedNow: 0, backlogSize: 5, everReturned: false }), true)
+eq('normal quiet drain after a successful one → silent',
+  isCursorRegression({ returnedNow: 0, backlogSize: 5, everReturned: true }), false)
+eq('empty backlog → silent',
+  isCursorRegression({ returnedNow: 0, backlogSize: 0, everReturned: false }), false)
+eq('productive drain → silent',
+  isCursorRegression({ returnedNow: 3, backlogSize: 5, everReturned: false }), false)
+
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) FAILED`)
   process.exit(1)
 }
 console.log('\nall poll-health assertions passed')
+
