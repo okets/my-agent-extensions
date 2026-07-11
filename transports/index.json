@@ -1,0 +1,102 @@
+{
+  "schema": 1,
+  "contract_version": "0.1",
+  "connectors": [
+    {
+      "name": "discord",
+      "path": "transports/examples/discord",
+      "backend": "discord-gateway",
+      "upstream": "push",
+      "roles": [
+        "dedicated"
+      ],
+      "menu": {
+        "label": "Discord",
+        "description": "Chat with me on Discord — DMs, images, files.",
+        "requirements": [
+          "A Discord account and a free bot token from the Developer Portal (I'll walk you through it)"
+        ],
+        "effort": "a few minutes, guided — we do it together right now",
+        "impact": 0
+      },
+      "requires_env": [
+        "DISCORD_BOT_TOKEN",
+        "MEDIA_ENDPOINT",
+        "MEDIA_TOKEN"
+      ]
+    },
+    {
+      "name": "line",
+      "path": "transports/examples/line",
+      "backend": "line-messaging-api",
+      "upstream": "webhook",
+      "roles": [
+        "dedicated"
+      ],
+      "menu": {
+        "label": "LINE",
+        "description": "Chat with me on LINE — messages, photos, voice.",
+        "requirements": [
+          "A LINE account and a free Official Account + Messaging API channel (I'll walk you through it)",
+          "A public webhook door on my machine (I set this up as part of the build if it's not there yet)"
+        ],
+        "effort": "a few minutes, guided — plus the webhook door if it's the first webhook channel",
+        "impact": 0
+      },
+      "requires_env": [
+        "LINE_CHANNEL_ACCESS_TOKEN",
+        "LINE_CHANNEL_SECRET",
+        "WEBHOOK_PUBLIC_BASE",
+        "MEDIA_ENDPOINT",
+        "MEDIA_TOKEN"
+      ]
+    },
+    {
+      "name": "telegram",
+      "path": "transports/examples/telegram",
+      "backend": "telegram-bot-api",
+      "upstream": "poll",
+      "roles": [
+        "dedicated"
+      ],
+      "menu": {
+        "label": "Telegram",
+        "description": "Chat with me on Telegram — messages, photos, voice notes.",
+        "requirements": [
+          "A Telegram account and a free bot token from @BotFather (I'll walk you through it)"
+        ],
+        "effort": "a few minutes, guided — we do it together right now",
+        "impact": 0
+      },
+      "requires_env": [
+        "TELEGRAM_BOT_TOKEN",
+        "MEDIA_ENDPOINT",
+        "MEDIA_TOKEN"
+      ]
+    },
+    {
+      "name": "whatsapp",
+      "path": "transports/examples/whatsapp",
+      "backend": "baileys",
+      "upstream": "socket",
+      "roles": [
+        "dedicated",
+        "personal"
+      ],
+      "menu": {
+        "label": "WhatsApp",
+        "description": "Chat with me on WhatsApp — messages, photos, voice notes.",
+        "requirements": [
+          "Your WhatsApp on your phone to scan a pairing code (like WhatsApp Web; no extra account)"
+        ],
+        "effort": "a few minutes, guided — we do it together right now",
+        "impact": 0
+      },
+      "requires_env": [
+        "WHATSAPP_PHONE_NUMBER",
+        "MEDIA_ENDPOINT",
+        "MEDIA_TOKEN"
+      ]
+    }
+  ]
+}
