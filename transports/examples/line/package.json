@@ -1,0 +1,11 @@
+{
+  "name": "line",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-contained LINE Messaging API transport connector — webhook-PUSH inbound (raw-body HMAC signature verify), push-message outbound.",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "tsx": "^4.22.3"
+  }
+}
