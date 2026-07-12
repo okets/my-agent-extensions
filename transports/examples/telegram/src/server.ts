@@ -785,16 +785,23 @@ function noteLoopback(): void {
   }
 }
 
+/** Hard bound on the ONE-SHOT startup getMe probe. The probe GATES poll arming, so it MUST NOT hang:
+ *  a slow/black-holed getMe (no response) would otherwise block the long-poll from ever arming while
+ *  transport/health still reports a synthetic "up" — silently dead-but-green (2026-07-12 live fix).
+ *  A definitive 401/404 always returns well under this bound; a timeout is treated as "not a credential
+ *  verdict" (see catch) so the poll still arms and the poll loop's own backoff/staleness takes over. */
+const GETME_PROBE_TIMEOUT_MS = 10_000
+
 /** ONE-SHOT startup credential probe (LIVE mode only — never runs in ECHO/cert). getMe is the
  *  cheapest authenticated call: a 401 (unauthorized) or 404 (malformed/incomplete token — the
  *  BotFather half-copy) is TERMINAL. Latch `credentialInvalid` so transport/health reports
  *  reason:'credential' (a human must re-supply the secret) and page ONCE via needs_attention with
- *  a plain-language message. Any other outcome (2xx, 5xx, network error) is NOT a credential
+ *  a plain-language message. Any other outcome (2xx, 5xx, network error, TIMEOUT) is NOT a credential
  *  verdict — the poll loop's own backoff/staleness handles those. Runs exactly once per process
- *  start; never retry-looped. */
+ *  start; never retry-looped. Bounded by GETME_PROBE_TIMEOUT_MS because it gates poll arming. */
 async function probeCredentialOnce(): Promise<void> {
   try {
-    const resp = await fetch(TG('getMe'), { method: 'POST' })
+    const resp = await fetch(TG('getMe'), { method: 'POST', signal: AbortSignal.timeout(GETME_PROBE_TIMEOUT_MS) })
     if (resp.status === 401 || resp.status === 404) {
       credentialInvalid = true
       console.warn(
@@ -808,7 +815,8 @@ async function probeCredentialOnce(): Promise<void> {
         .catch(() => {})
     }
   } catch {
-    // Network error ≠ credential verdict — never latch terminal on an environmental failure.
+    // Network error OR the GETME_PROBE_TIMEOUT_MS abort ≠ credential verdict — never latch terminal on
+    // an environmental/slow failure, and (critically) never let it prevent the poll from arming.
   }
 }
 
