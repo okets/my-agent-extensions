@@ -5,7 +5,8 @@ building AI assistants on the Claude Agent SDK. Extensions are **files, not code
 you drop a self-contained folder into the agent, it gets discovered, supervised, and certified.
 
 **Transports** — the connectors that carry conversations over WhatsApp, Telegram, Discord, LINE,
-and more — are the first extension type. Other self-developed capability types will join over time.
+and more — are the first extension type. **Capabilities** — self-built abilities such as web search,
+speech, or vision — are shared here too, as worked examples to read for patterns and adapt.
 
 ```
 my-agent-extensions/
@@ -17,7 +18,9 @@ my-agent-extensions/
 │   └── scaffold/            # a start-here connector skeleton
 ├── packages/
 │   └── transport-kit/       # npm: the conformance harness + wire types + `certify` CLI
-└── capabilities/            # (future) other extension types
+└── capabilities/            # worked capability examples — inspiration, not canon
+    ├── README.md            #   read first: patterns to adapt, not components to install
+    └── examples/            #   e.g. image-search (keyless-fallback web image search)
 ```
 
 ## Build a transport connector
@@ -50,6 +53,12 @@ Built a connector for a backend that isn't here yet? Once it certifies and you'v
 a PR adding it under `transports/examples/<backend>/` — after sanitizing anything specific to your
 machine (credentials, private paths, personal names). Every contributed example enriches the pool
 every other builder — human or agent — starts from.
+
+## Sharing a capability example
+
+Capabilities are shared differently from connectors — as **inspiration, not canon**. See
+[`capabilities/README.md`](capabilities/README.md): read the worked examples for their shape and
+re-derive your own; there is no certification and nothing is installed verbatim.
 
 ## License
 

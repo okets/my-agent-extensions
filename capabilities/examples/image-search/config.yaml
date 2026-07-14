@@ -1,0 +1,8 @@
+# Image Search capability configuration
+# Non-secret settings — secrets go in .env (GOOGLE_CSE_API_KEY, GOOGLE_CSE_ID)
+
+# Default number of candidates to return when count is not specified
+default_count: 5
+
+# Google CSE safe-search setting: "active" | "moderate" | "off"
+safe_search: "active"
