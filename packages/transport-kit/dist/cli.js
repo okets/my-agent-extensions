@@ -204,9 +204,10 @@ var TransportSupervisor = class _TransportSupervisor extends EventEmitter {
     this.heldForAttention = true;
   }
   spawnOnce() {
+    const scopedEnv = typeof this.o.scopedEnv === "function" ? this.o.scopedEnv() : this.o.scopedEnv;
     const child = spawn2(this.o.command, this.o.args, {
       cwd: this.o.cwd,
-      env: this.o.scopedEnv,
+      env: scopedEnv,
       // SCOPED — no inherited process.env
       stdio: ["pipe", "pipe", "pipe"],
       // M10-S8 GAP-2: own process group (pgid = child.pid), so teardown can signal the
@@ -412,7 +413,7 @@ var HEALTH_TOOL = "transport/health";
 var HealthToolOutputSchema = z.object({
   upstreamConnected: z.boolean(),
   lastUpstreamActivityMs: z.number().optional(),
-  reason: z.enum(["transient", "logged_out", "network"]).optional(),
+  reason: z.enum(["transient", "logged_out", "credential", "network"]).optional(),
   inboundReceived: z.number().optional(),
   inboundEnqueued: z.number().optional()
 });
@@ -626,10 +627,12 @@ function dialectSupports(dialect, feature) {
 }
 
 // ../core/src/transports/render/split.ts
-function markerWidth(total) {
+function defaultFormatMarker(index, total) {
+  return ` (${index}/${total})`;
+}
+function markerWidth(total, formatMarker) {
   if (total <= 1) return 0;
-  const digits = String(total).length;
-  return 2 + digits + 1 + digits + 1;
+  return formatMarker(total, total).length;
 }
 function packChunks(text, budget) {
   if (budget <= 0) return [text];
@@ -672,22 +675,23 @@ function packChunks(text, budget) {
   flush();
   return chunks.length > 0 ? chunks : [""];
 }
-function splitToParts(text, maxLength) {
+function splitToParts(text, maxLength, opts = {}) {
+  const formatMarker = opts.formatMarker ?? defaultFormatMarker;
   if (text.length <= maxLength) return [text];
   let prevTotal = -1;
   let chunks = [];
-  let total = Math.ceil(text.length / Math.max(1, maxLength - markerWidth(99))) + 1;
+  let total = Math.ceil(text.length / Math.max(1, maxLength - markerWidth(99, formatMarker))) + 1;
   for (let i = 0; i < 4 && total !== prevTotal; i++) {
     prevTotal = total;
-    const budget = Math.max(1, maxLength - markerWidth(total));
+    const budget = Math.max(1, maxLength - markerWidth(total, formatMarker));
     chunks = packChunks(text, budget);
     total = chunks.length;
   }
   if (total <= 1) return chunks;
-  const finalBudget = Math.max(1, maxLength - markerWidth(total));
+  const finalBudget = Math.max(1, maxLength - markerWidth(total, formatMarker));
   chunks = packChunks(text, finalBudget);
   total = chunks.length;
-  return chunks.map((c, idx) => total > 1 ? `${c} (${idx + 1}/${total})` : c);
+  return chunks.map((c, idx) => total > 1 ? `${c}${formatMarker(idx + 1, total)}` : c);
 }
 
 // ../core/src/transports/render/render.ts
@@ -888,7 +892,9 @@ function renderForDialect(markdown, dialect, opts = {}) {
   }
   const text = blocks.join("\n\n");
   const maxLength = opts.maxLength ?? DIALECTS[ctx.dialect].defaultMaxLength;
-  const parts = splitToParts(text, maxLength);
+  const parts = splitToParts(text, maxLength, {
+    formatMarker: (index, total) => escapeText(` (${index}/${total})`, ctx.dialect)
+  });
   return { parts, degraded: ctx.degraded };
 }
 
@@ -917,6 +923,7 @@ async function renderAndPace(opts) {
 // ../core/src/transports/mcp-wire-adapter.ts
 var DEFAULT_PROBE_TIMEOUT_MS = 5e3;
 var HEALTH_PROBE_TIMEOUT_MS = 5e3;
+var HANDSHAKE_TIMEOUT_MS = 3e4;
 var UPSTREAM_MAX_ATTEMPTS = 5;
 var UPSTREAM_HEALTHY_PROBES_TO_RESET = 2;
 var INBOUND_DIVERGENCE_SUSTAINED_THRESHOLD = 3;
@@ -997,6 +1004,8 @@ var McpWireAdapter = class extends EventEmitter2 {
   draining = false;
   drainQueued = false;
   firstConnect = null;
+  /** Startup handshake deadline (ms) — see HANDSHAKE_TIMEOUT_MS. */
+  handshakeTimeoutMs;
   /** Framework-render mode config (D-EXEC-2): undefined dialect → legacy raw send. */
   dialect;
   maxLength;
@@ -1092,6 +1101,7 @@ var McpWireAdapter = class extends EventEmitter2 {
     this.keepaliveMs = o.keepaliveMs;
     this.upstreamSelfWindowMs = o.upstreamSelfWindowMs;
     this.selfHeal = o.selfHeal ?? false;
+    this.handshakeTimeoutMs = o.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
     this.cursor = new CursorStore(join2(o.cursorDir, o.id));
     this.hostStats = o.hostStats;
     if (o.dialect) {
@@ -1104,7 +1114,13 @@ var McpWireAdapter = class extends EventEmitter2 {
       command: o.command,
       args: o.args,
       cwd: o.cwd,
-      scopedEnv: { ...safeBaseline(), ...o.scopedEnv },
+      // Passed DOWN as a resolver: the supervisor re-invokes it per spawn, so both the safe
+      // baseline (PATH etc.) and the caller's scoped env are re-read on every respawn — a secret
+      // corrected while the connector flaps reaches the next respawn (env freshness).
+      scopedEnv: () => ({
+        ...safeBaseline(),
+        ...typeof o.scopedEnv === "function" ? o.scopedEnv() : o.scopedEnv
+      }),
       backoffMs: o.backoffMs,
       maxRestarts: o.maxRestarts,
       windowMs: o.windowMs,
@@ -1168,7 +1184,7 @@ var McpWireAdapter = class extends EventEmitter2 {
    */
   onNeedsAttention(params) {
     this.status.connected = false;
-    this.status.lastDisconnect = { at: /* @__PURE__ */ new Date(), status: "logged_out", error: params?.reason ?? "needs_attention", loggedOut: true };
+    this.status.lastDisconnect = { at: /* @__PURE__ */ new Date(), status: "logged_out", error: params?.detail ?? params?.reason ?? "needs_attention", loggedOut: true };
     this.supervisor.holdRestart();
     this.transitionRecoveryState("needs_attention", params?.reason ?? "logged_out", { forceEmit: true });
   }
@@ -1317,10 +1333,13 @@ var McpWireAdapter = class extends EventEmitter2 {
     console.warn(
       `[wire:${this.id}] upstream health DECISION: ${dead ? "dead" : "stale"} reason=${health.reason ?? "unspecified"} lastUpstreamActivityMs=${health.lastUpstreamActivityMs ?? "n/a"}`
     );
-    if (health.reason === "logged_out") {
+    if (health.reason === "logged_out" || health.reason === "credential") {
       this.lastDisconnectClass = "logged_out";
       this.emit("liveness-lost", "logged_out");
-      this.onNeedsAttention({ reason: "logged_out" });
+      this.onNeedsAttention({
+        reason: health.reason === "credential" ? "credential" : "logged_out",
+        ...health.reason === "credential" ? { detail: "the stored credential is invalid or incomplete \u2014 re-enter the secret" } : {}
+      });
       this.upstreamAttempts = 0;
       return true;
     }
@@ -1502,7 +1521,7 @@ var McpWireAdapter = class extends EventEmitter2 {
         if (result.parts.length > 1) {
           const d = resolveDialect(this.dialect);
           const cap = this.maxLength ?? (d ? DIALECTS[d].defaultMaxLength : 4096);
-          wire = wire.replace(/ \(1\/\d+\)\s*$/, "");
+          wire = wire.replace(/ \\?\(1\/\d+\\?\)\s*$/, "");
           wire = wire.slice(0, cap - 1) + "\u2026";
         }
       } catch {
@@ -1582,7 +1601,19 @@ var McpWireAdapter = class extends EventEmitter2 {
       const transport = new ChildStreamTransport(child);
       const client = new Client({ name: `transport-${this.id}`, version: "1.0.0" });
       client.fallbackNotificationHandler = this.handleNotification;
-      await client.connect(transport);
+      const handshakeAbort = new AbortController();
+      const handshakeTimer = setTimeout(() => handshakeAbort.abort(), this.handshakeTimeoutMs);
+      try {
+        await client.connect(transport, { signal: handshakeAbort.signal });
+      } catch (e) {
+        if (handshakeAbort.signal.aborted) {
+          this.onHandshakeTimeout();
+          return;
+        }
+        throw e;
+      } finally {
+        clearTimeout(handshakeTimer);
+      }
       this.connectCount++;
       this.client = client;
       this.transport = transport;
@@ -1614,6 +1645,29 @@ var McpWireAdapter = class extends EventEmitter2 {
     this.status.lastError = e.message;
     if (!/connection closed|-32000/i.test(e.message)) this.emit("error", e);
     this.firstConnect?.reject(e);
+    this.firstConnect = null;
+  }
+  /**
+   * The startup MCP handshake exceeded its deadline (attach()): the child spawned but its MCP server
+   * never answered `initialize` — a deaf/wedged startup. This is definitionally a PRE-ATTACH failure
+   * (noteAttached() runs only after a successful handshake), the same class the supervisor's breaker
+   * already routes to needs_attention on a crash-loop. Rather than recycle-loop a child that will only
+   * re-hang (5×30s never fits the 60s breaker window), land the EXISTING needs_attention lane directly
+   * — mirroring the upstream/inbound bounded-ladder exhaustion paths — with a plain reason.
+   *
+   * Kill the deaf child via stop() (SIGTERM/SIGKILL) so the supervisor does NOT keep-alive respawn into
+   * another hang; `stopped` is cleared by a later heal/manual retry (connect() → supervisor.start(),
+   * which also resets the hold + breaker state). Rejecting firstConnect lets boot's awaited connect()
+   * proceed: the autowire loop logs + continues to the next transport, and the heartbeat starts.
+   */
+  onHandshakeTimeout() {
+    this.status.connected = false;
+    this.status.running = false;
+    this.status.lastError = `startup MCP handshake did not complete within ${this.handshakeTimeoutMs}ms`;
+    void this.supervisor.stop().catch(() => {
+    });
+    this.transitionRecoveryState("needs_attention", "startup-handshake-timeout");
+    this.firstConnect?.reject(new Error(this.status.lastError));
     this.firstConnect = null;
   }
   /** Single-flight drain (DECISIONS.md D6): never run two drains concurrently; if a wakeup
@@ -1804,17 +1858,20 @@ var requireCjs = createRequire(import.meta.url);
 
 // ../core/src/transports/generic-transport-plugin.ts
 function buildAdapter(o) {
-  const scopedEnv = { ...o.extraEnv ?? {} };
-  for (const k of o.requiredEnv) {
-    const v = process.env[k];
-    if (v != null) scopedEnv[k] = v;
-  }
+  const resolveScopedEnv = () => {
+    const scopedEnv = { ...o.extraEnv ?? {} };
+    for (const k of o.requiredEnv) {
+      const v = process.env[k];
+      if (v != null) scopedEnv[k] = v;
+    }
+    return scopedEnv;
+  };
   return new McpWireAdapter({
     id: o.id,
     command: o.mcp.command,
     args: o.mcp.args,
     cwd: o.folderAbs,
-    scopedEnv,
+    scopedEnv: resolveScopedEnv,
     cursorDir: o.cursorDir,
     dialect: o.dialect,
     sendRatePerMin: o.sendRatePerMin,

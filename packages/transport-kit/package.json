@@ -1,9 +1,26 @@
 {
   "name": "my-agent-transport-kit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Conformance harness, wire-protocol types, and manifest validator for authoring my-agent transport connectors. Certify a connector folder in a clean directory — no framework checkout required.",
   "type": "module",
   "license": "MIT",
+  "keywords": [
+    "my-agent",
+    "transport",
+    "connector",
+    "conformance",
+    "claude-agent-sdk",
+    "mcp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/okets/my-agent-extensions.git",
+    "directory": "packages/transport-kit"
+  },
+  "homepage": "https://github.com/okets/my-agent-extensions/tree/main/packages/transport-kit#readme",
+  "bugs": {
+    "url": "https://github.com/okets/my-agent-extensions/issues"
+  },
   "engines": {
     "node": ">=20"
   },
@@ -11,10 +28,8 @@
     "my-agent-transport-kit": "dist/cli.js"
   },
   "main": "dist/lib.js",
-  "types": "dist/lib.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/lib.d.ts",
       "import": "./dist/lib.js"
     }
   },
