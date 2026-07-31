@@ -47,7 +47,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 // B4: the pure poll-staleness verdict for transport/health (dependency-free; unit-tested as a tsx
 // script — see poll-health.test.ts). The long-poll timeout is sourced from here too (single source).
-import { computePollHealth, isCursorRegression, LONG_POLL_TIMEOUT_S, shouldLatchConformanceSeen } from './poll-health.js'
+import { computePollHealth, isCursorRegression, LONG_POLL_TIMEOUT_S, shouldLatchConformanceSeen, pollWatchdogVerdict, watchdogEnabled } from './poll-health.js'
 
 // ── Wire strings (inlined — never import a framework module) ──────────────────────────────
 const SEND_TOOL = 'transport/send'
@@ -746,6 +746,15 @@ let deferredPollTimer: ReturnType<typeof setTimeout> | null = null
 // transport/health verdict reports the upstream down once it goes past the cadence window. `pollLoggedOut`
 // latches a hard 401 (token revoked) — terminal, so the framework pages rather than spins (Invariant 5).
 let lastSuccessfulGetUpdatesAt = 0
+// Poll-watchdog state (2026-07-30 silent-park incident): the currently in-flight getUpdates fetch,
+// abortable by the watchdog when it outlives the long-poll deadline while the activity clock is stale
+// (a silent half-open connection — the one failure the loop's own retry path cannot see).
+let inFlightAbort: AbortController | null = null
+let inFlightStartedAt: number | null = null
+// Transition-only poll observability: consecutive failed getUpdates cycles (0 = healthy). One line
+// when a failure streak starts, one on recovery with the count — never a line per cycle. The 2026-07-30
+// contention burst was undiagnosable for a day because this connector logged nothing.
+let pollFailStreak = 0
 let pollLoggedOut = false
 // Credential probe: latches when the ONE-SHOT startup getMe probe returns 401/404 — the token is
 // invalid or incomplete (e.g. a half-copied BotFather token). TERMINAL: fed to transport/health as
@@ -826,6 +835,22 @@ function startLivePolling(): void {
   // B4: anchor the cadence clock at arm-time so transport/health doesn't read a freshly-armed poll as
   // instantly stale before the first getUpdates returns (a long-poll cycle can take up to the timeout).
   lastSuccessfulGetUpdatesAt = Date.now()
+  // Connector-side poll watchdog (CONTRACT §upstream watchdog; 2026-07-30 silent-park incident). The
+  // loop retries every VISIBLE failure forever; this timer catches the invisible one — a getUpdates
+  // fetch wedged on a silent half-open connection — by aborting it so the loop's own retry path takes
+  // over (the poll-shape analogue of WhatsApp's force-close).
+  if (watchdogEnabled(process.env.SELFHEAL_WATCHDOG_OFF)) {
+    const watchdog = setInterval(() => {
+      const verdict = pollWatchdogVerdict({ lastSuccessfulGetUpdatesAt, inFlightStartedAt, now: Date.now() })
+      if (verdict === 'abort-wedged' && inFlightAbort) {
+        console.warn('[telegram] watchdog: aborting a wedged getUpdates (no 2xx past the stale window)')
+        inFlightAbort.abort()
+      }
+    }, 15_000)
+    watchdog.unref()
+  } else {
+    console.warn('[telegram] SELFHEAL_WATCHDOG_OFF=1 — connector poll watchdog NOT armed; relying on the framework probe→recycle net')
+  }
   void (async () => {
     // Credential probe FIRST (one getMe per process start): a 401/404 verdict is terminal — do NOT
     // arm the poll (getUpdates would only re-die on the same bad token, the silent recycle loop this
@@ -1026,16 +1051,28 @@ async function pollLoop(): Promise<void> {
   while (true) {
     try {
       const offset = pollOffset()
-      const resp = await fetch(TG('getUpdates'), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          ...(offset !== undefined ? { offset } : {}),
-          timeout: LONG_POLL_TIMEOUT_S,
-          // M10-S9: include message_reaction + edited_message so reactions and edits are surfaced.
-          allowed_updates: ['message', 'message_reaction', 'edited_message'],
-        }),
-      })
+      // Bounded cycle: the watchdog may abort THIS fetch when it outlives the long-poll deadline with
+      // a stale activity clock (a silent half-open connection would otherwise hang it forever — the
+      // 2026-07-30 hazard). The abort throws, landing in the catch → the normal retry path.
+      inFlightAbort = new AbortController()
+      inFlightStartedAt = Date.now()
+      let resp: Awaited<ReturnType<typeof fetch>>
+      try {
+        resp = await fetch(TG('getUpdates'), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            ...(offset !== undefined ? { offset } : {}),
+            timeout: LONG_POLL_TIMEOUT_S,
+            // M10-S9: include message_reaction + edited_message so reactions and edits are surfaced.
+            allowed_updates: ['message', 'message_reaction', 'edited_message'],
+          }),
+          signal: inFlightAbort.signal,
+        })
+      } finally {
+        inFlightAbort = null
+        inFlightStartedAt = null
+      }
       // B4: a hard 401 = the bot token is revoked / unauthorized — a TERMINAL condition. A human must
       // supply a new token (re-pair). Page once via needs_attention and STOP the loop — never spin a
       // terminal error (Invariant 5: terminal-vs-environmental). transport/health then reports
@@ -1053,6 +1090,12 @@ async function pollLoop(): Promise<void> {
       // just-restarted bot. The cadence-staleness check surfaces a poll that never recovers.
       if (resp.status === 409) last409At = Date.now()
       if (resp.status === 409 || !resp.ok) {
+        if (pollFailStreak === 0) {
+          console.warn(resp.status === 409
+            ? '[telegram] getUpdates 409 — another consumer holds the long-poll (contention); retrying'
+            : `[telegram] getUpdates failing (HTTP ${resp.status}) — retrying`)
+        }
+        pollFailStreak++
         await sleep(2000)
         continue
       }
@@ -1060,6 +1103,10 @@ async function pollLoop(): Promise<void> {
       // clear the 409 settle marker (contention resolved — the old child is gone).
       lastSuccessfulGetUpdatesAt = Date.now()
       last409At = 0
+      if (pollFailStreak > 0) {
+        console.warn(`[telegram] getUpdates recovered after ${pollFailStreak} failed cycle(s)`)
+        pollFailStreak = 0
+      }
       const body = (await resp.json()) as { result?: TelegramUpdate[] }
       const newCount = await ingest(body.result ?? [])
       if (newCount > 0) await mcp.notification({ method: MESSAGE_AVAILABLE, params: {} })
@@ -1067,8 +1114,13 @@ async function pollLoop(): Promise<void> {
       // past the framework-drained cursor). Sleep to avoid a busy loop; the window closes once the
       // framework drains and lastDrainedCursor advances.
       if (newCount === 0) await sleep(1000)
-    } catch {
-      // Transient fetch/network error — back off and retry, never crash the connector.
+    } catch (err) {
+      // Transient fetch/network error — back off and retry, never crash the connector. A watchdog
+      // abort of a wedged fetch lands here too and rides the same retry path.
+      if (pollFailStreak === 0) {
+        console.warn(`[telegram] getUpdates fetch error (${err instanceof Error ? err.name : 'unknown'}) — retrying`)
+      }
+      pollFailStreak++
       await sleep(2000)
     }
   }

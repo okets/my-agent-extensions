@@ -16,7 +16,7 @@
  * poll-staleness decision (the never-lie contract the A4 conformance probe enforces) + the cert-run
  * CRIES-WOLF affordance + the terminal-vs-environmental split (Invariant 5).
  */
-import { computePollHealth, isCursorRegression, POLL_STALE_WINDOW_MS, SETTLE_GRACE_MS, LONG_POLL_TIMEOUT_S, shouldLatchConformanceSeen } from './poll-health.js'
+import { computePollHealth, isCursorRegression, POLL_STALE_WINDOW_MS, SETTLE_GRACE_MS, LONG_POLL_TIMEOUT_S, shouldLatchConformanceSeen, pollWatchdogVerdict, WATCHDOG_FETCH_GRACE_MS, watchdogEnabled } from './poll-health.js'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
@@ -199,6 +199,32 @@ eq('empty backlog → silent',
   isCursorRegression({ returnedNow: 0, backlogSize: 0, everReturned: false }), false)
 eq('productive drain → silent',
   isCursorRegression({ returnedNow: 3, backlogSize: 5, everReturned: false }), false)
+
+// ── Poll-shape watchdog verdict (2026-07-30 silent-park incident) ──────────────────────────────────
+// The loop retries every VISIBLE error forever; the one failure it cannot see is a getUpdates fetch
+// wedged on a silent half-open connection (no client-side deadline). The watchdog aborts the in-flight
+// fetch ONLY when the activity clock is stale past the cadence window AND the fetch has outlived the
+// long-poll timeout plus grace — everything else belongs to the loop's own retry path.
+{
+  const base = { lastSuccessfulGetUpdatesAt: 1_000_000, windowMs: 150_000, longPollTimeoutMs: 50_000 }
+  eq('watchdog: fresh clock, in-flight within deadline → ok',
+    pollWatchdogVerdict({ ...base, inFlightStartedAt: 1_140_000, now: 1_149_000 }), 'ok')
+  eq('watchdog: stale clock + fetch outlived timeout+grace → abort-wedged',
+    pollWatchdogVerdict({ ...base, inFlightStartedAt: 1_160_000, now: 1_160_000 + 50_000 + WATCHDOG_FETCH_GRACE_MS + 1_000 }), 'abort-wedged')
+  eq('watchdog: stale clock but NO in-flight fetch (loop cycling on errors) → ok (loop owns retries)',
+    pollWatchdogVerdict({ ...base, inFlightStartedAt: null, now: 1_000_000 + 200_000 }), 'ok')
+  eq('watchdog: fetch outlived deadline but clock still fresh → ok (fresh clock protects in-flight)',
+    pollWatchdogVerdict({ ...base, lastSuccessfulGetUpdatesAt: 1_200_000, inFlightStartedAt: 1_100_000, now: 1_210_000 }), 'ok')
+  eq('watchdog: stale clock + fetch exactly at the deadline boundary → ok (strictly greater aborts)',
+    pollWatchdogVerdict({ ...base, inFlightStartedAt: 1_160_000, now: 1_160_000 + 50_000 + WATCHDOG_FETCH_GRACE_MS }), 'ok')
+  eq('watchdog: defaults (windowMs/longPollTimeoutMs omitted) use POLL_STALE_WINDOW_MS + LONG_POLL_TIMEOUT_S',
+    pollWatchdogVerdict({ lastSuccessfulGetUpdatesAt: 1_000_000, inFlightStartedAt: 1_100_000, now: 1_000_000 + POLL_STALE_WINDOW_MS + LONG_POLL_TIMEOUT_S * 1000 + WATCHDOG_FETCH_GRACE_MS + 1 }), 'abort-wedged')
+}
+
+// ── Kill-switch (A6, _CONTRACT.md §Kill-switch) ────────────────────────────────────────────────────
+eq('kill-switch: SELFHEAL_WATCHDOG_OFF=1 → watchdog NOT armed', watchdogEnabled('1'), false)
+eq('kill-switch: unset → watchdog armed', watchdogEnabled(undefined), true)
+eq('kill-switch: any other value → watchdog armed', watchdogEnabled('0'), true)
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) FAILED`)
