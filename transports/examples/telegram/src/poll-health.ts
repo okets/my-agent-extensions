@@ -168,6 +168,46 @@ export function computePollHealth(input: PollHealthInput): HealthReport {
   return { upstreamConnected: true, lastUpstreamActivityMs: lastSuccessfulGetUpdatesAt }
 }
 
+/** How much longer than the server-side long-poll timeout an in-flight getUpdates may run before the
+ *  watchdog treats it as a wedged half-open connection. Covers response transit + network jitter —
+ *  a healthy cycle resolves within LONG_POLL_TIMEOUT_S server-side, so timeout+grace is generous. */
+export const WATCHDOG_FETCH_GRACE_MS = 15_000
+
+/**
+ * Connector-side watchdog verdict (CONTRACT "upstream watchdog" mandate, poll shape — 2026-07-30
+ * silent-park incident). The poll loop retries every VISIBLE failure forever (non-2xx, thrown fetch);
+ * the ONE failure it cannot see is a fetch that never resolves — a silent half-open TCP connection —
+ * which freezes `lastSuccessfulGetUpdatesAt` while the process still answers MCP pings. The watchdog
+ * (a single setInterval in server.ts, gated on SELFHEAL_WATCHDOG_OFF) aborts the in-flight fetch so
+ * the loop's own retry path takes over — the poll-shape analogue of WhatsApp's force-close.
+ *
+ * Abort ONLY when BOTH hold:
+ *   - the activity clock is stale past the cadence window (nothing succeeded for a long time), AND
+ *   - an in-flight getUpdates has outlived the long-poll timeout plus grace (it can no longer be an
+ *     honest slow cycle).
+ * A stale clock with NO in-flight fetch means the loop is cycling on visible errors — that is the
+ * loop's territory, never the watchdog's.
+ */
+export function pollWatchdogVerdict(input: {
+  /** ms-epoch of the last 2xx getUpdates (anchored at arm-time); 0 = never. */
+  lastSuccessfulGetUpdatesAt: number
+  /** ms-epoch when the currently in-flight getUpdates fetch started; null = none in flight. */
+  inFlightStartedAt: number | null
+  /** Current time (injected for testability). */
+  now: number
+  /** Cadence window; defaults to POLL_STALE_WINDOW_MS. */
+  windowMs?: number
+  /** The long-poll timeout in ms; defaults to LONG_POLL_TIMEOUT_S * 1000. */
+  longPollTimeoutMs?: number
+}): 'ok' | 'abort-wedged' {
+  const windowMs = input.windowMs ?? POLL_STALE_WINDOW_MS
+  const longPollTimeoutMs = input.longPollTimeoutMs ?? LONG_POLL_TIMEOUT_S * 1000
+  if (input.inFlightStartedAt === null) return 'ok'
+  const clockStale = input.now - input.lastSuccessfulGetUpdatesAt > windowMs
+  const fetchOutlived = input.now - input.inFlightStartedAt > longPollTimeoutMs + WATCHDOG_FETCH_GRACE_MS
+  return clockStale && fetchOutlived ? 'abort-wedged' : 'ok'
+}
+
 /** Cursor-regression tripwire (2026-07-11 live incident) — pure decision; wired in server.ts drain().
  *
  *  With a GENUINE durable cursor, every update the poll buffers has update_id > cursor (the poll
