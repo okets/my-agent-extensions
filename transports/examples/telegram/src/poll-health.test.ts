@@ -16,7 +16,7 @@
  * poll-staleness decision (the never-lie contract the A4 conformance probe enforces) + the cert-run
  * CRIES-WOLF affordance + the terminal-vs-environmental split (Invariant 5).
  */
-import { computePollHealth, isCursorRegression, POLL_STALE_WINDOW_MS, SETTLE_GRACE_MS, LONG_POLL_TIMEOUT_S, shouldLatchConformanceSeen, pollWatchdogVerdict, WATCHDOG_FETCH_GRACE_MS } from './poll-health.js'
+import { computePollHealth, isCursorRegression, POLL_STALE_WINDOW_MS, SETTLE_GRACE_MS, LONG_POLL_TIMEOUT_S, shouldLatchConformanceSeen, pollWatchdogVerdict, WATCHDOG_FETCH_GRACE_MS, watchdogEnabled } from './poll-health.js'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
@@ -220,6 +220,11 @@ eq('productive drain → silent',
   eq('watchdog: defaults (windowMs/longPollTimeoutMs omitted) use POLL_STALE_WINDOW_MS + LONG_POLL_TIMEOUT_S',
     pollWatchdogVerdict({ lastSuccessfulGetUpdatesAt: 1_000_000, inFlightStartedAt: 1_100_000, now: 1_000_000 + POLL_STALE_WINDOW_MS + LONG_POLL_TIMEOUT_S * 1000 + WATCHDOG_FETCH_GRACE_MS + 1 }), 'abort-wedged')
 }
+
+// ── Kill-switch (A6, _CONTRACT.md §Kill-switch) ────────────────────────────────────────────────────
+eq('kill-switch: SELFHEAL_WATCHDOG_OFF=1 → watchdog NOT armed', watchdogEnabled('1'), false)
+eq('kill-switch: unset → watchdog armed', watchdogEnabled(undefined), true)
+eq('kill-switch: any other value → watchdog armed', watchdogEnabled('0'), true)
 
 if (failures > 0) {
   console.error(`\n${failures} assertion(s) FAILED`)

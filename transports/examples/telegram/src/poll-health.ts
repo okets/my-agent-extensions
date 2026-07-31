@@ -208,6 +208,14 @@ export function pollWatchdogVerdict(input: {
   return clockStale && fetchOutlived ? 'abort-wedged' : 'ok'
 }
 
+/** KILL-SWITCH decision (A6 — `SELFHEAL_WATCHDOG_OFF`, _CONTRACT.md §Kill-switch). Returns whether
+ *  the connector's OWN poll watchdog should be ARMED. Pass `process.env.SELFHEAL_WATCHDOG_OFF`; the
+ *  literal env-var NAME is inlined at the read site in server.ts (connectors never import framework
+ *  modules). `'1'` disarms the connector-side watchdog — the framework probe→recycle net remains. */
+export function watchdogEnabled(flag: string | undefined): boolean {
+  return flag !== '1'
+}
+
 /** Cursor-regression tripwire (2026-07-11 live incident) — pure decision; wired in server.ts drain().
  *
  *  With a GENUINE durable cursor, every update the poll buffers has update_id > cursor (the poll
