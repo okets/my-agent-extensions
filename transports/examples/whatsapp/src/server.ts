@@ -1344,7 +1344,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     // content arrives ALREADY RENDERED for the whatsapp dialect (*bold* _italic_ ~strike~ `code`) —
     // send VERBATIM. A pure-media reply arrives with empty content → skip the blank text bubble.
     if (content && content.length > 0) {
-      const result = await sock.sendMessage(to, { text: content })
+      // Baileys builds a link preview for any text with a URL through the optional peer dependency
+      // `link-preview-js`. We do not install that, so every send with a link logged "url generation failed".
+      // `linkPreview: null` skips it; messages are sent exactly as before, without a preview card.
+      const result = await sock.sendMessage(to, { text: content, linkPreview: null })
       messageId = result?.key?.id ?? undefined
       // Remember our own outbound text so a reaction to THIS reply resolves to a snippet, and cache
       // the sent message so getMessage can resolve an edit of it.
@@ -1388,7 +1391,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const { to, messageId, content } = req.params.arguments as { to: string; messageId: string; content: string }
     if (!ECHO_MODE && isDeliverableTarget(to) && sock) {
       try {
-        await sock.sendMessage(to, { text: content, edit: { remoteJid: to, id: messageId, fromMe: true } })
+        await sock.sendMessage(to, { text: content, linkPreview: null, edit: { remoteJid: to, id: messageId, fromMe: true } })
       } catch (e) {
         console.warn(`[whatsapp] edit failed: ${e instanceof Error ? e.message : String(e)}`)
       }
