@@ -13,6 +13,8 @@
  *   - Degrades in steps: no picture (slow/failed thumbnail) → title+description card → plain text.
  *   - Only public http(s) hosts are fetched: loopback / private / link-local addresses are refused
  *     (SSRF guard on the first URL, on every redirect hop and on the thumbnail URL).
+ *   - Redirects are followed ACROSS hosts (www.cnn.com → edition.cnn.com) but only up to
+ *     MAX_REDIRECTS hops, only to http(s), and every hop is re-checked before it is requested.
  *   - Thumbnails use `sharp` only (Baileys' peer dependency, already resolved in the lockfile) — resize to a small JPEG. No other image dep.
  *
  * link-preview-js and sharp are imported lazily and are injectable, so the logic is unit-tested
@@ -104,6 +106,62 @@ async function assertPublicUrl(url: string, resolveHost: (h: string) => Promise<
   }
   const addr = await resolveHost(host)
   if (isPrivateAddress(addr)) throw new Error('refused: private address')
+}
+
+/** Max redirects followed for the page (cross-host allowed). The first request does not count. */
+export const MAX_REDIRECTS = 5
+
+/**
+ * Fetch the page with `getLinkPreview`, following up to MAX_REDIRECTS redirects, ACROSS hosts
+ * (www.cnn.com → edition.cnn.com, http → https, …).
+ *
+ * link-preview-js 3.2.0 follows at most ONE redirect hop itself (it fetches the forwarded URL once
+ * and parses whatever comes back), and calls `handleRedirects(base, forwarded)` for that hop. To
+ * support a longer chain with a hard cap we do the following loop: `handleRedirects` records the
+ * `Location` target (after refusing non-http(s) schemes) and returns false, which makes the library
+ * stop with "could not handle redirect"; we then start a fresh `getLinkPreview` on the recorded target.
+ * Every hop therefore starts with the library's own `resolveDNSHost` check (private / loopback /
+ * link-local refused) AND our `assertPublicUrl` (scheme + local-name + address) before any request.
+ * The page budget is shared by all hops (each hop gets what is left of it).
+ */
+async function fetchPageWithRedirects(
+  startUrl: string,
+  getLinkPreview: NonNullable<LinkPreviewDeps['getLinkPreview']>,
+  resolveHost: (h: string) => Promise<string>,
+  pageTimeoutMs: number,
+): Promise<unknown> {
+  const pageDeadline = Date.now() + pageTimeoutMs
+  let current = startUrl
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    if (hop > 0) await assertPublicUrl(current, resolveHost) // hop 0 is covered by resolveDNSHost below
+    const left = pageDeadline - Date.now()
+    if (left <= 0) throw new Error('page budget used up while following redirects')
+    const handBack: { next?: string } = {} // set by handleRedirects (object, so control-flow typing stays honest)
+    try {
+      return await getLinkPreview(current, {
+        timeout: left,
+        followRedirects: 'manual',
+        handleRedirects: (_base: string, forwarded: string) => {
+          // Throws (→ preview unavailable) on anything that is not a plain http(s) URL.
+          const u = new URL(forwarded)
+          if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('refused: redirect to non-http(s) scheme')
+          handBack.next = u.toString()
+          return false // hand the hop back to this loop; the next iteration re-checks it
+        },
+        resolveDNSHost: async (u: string) => {
+          const addr = await resolveHost(new URL(u).hostname)
+          if (isPrivateAddress(addr)) throw new Error('refused: private address')
+          return addr
+        },
+        headers: { 'user-agent': BROWSER_UA, 'accept-language': 'en-US,en;q=0.8' },
+      })
+    } catch (e) {
+      if (!handBack.next) throw e // a real failure, not a redirect hand-back
+      if (hop === MAX_REDIRECTS) throw new Error(`refused: more than ${MAX_REDIRECTS} redirects`)
+      current = handBack.next
+    }
+  }
+  throw new Error(`refused: more than ${MAX_REDIRECTS} redirects`) // unreachable; keeps the type checker honest
 }
 
 async function defaultMakeThumbnail(bytes: Buffer, width: number): Promise<Buffer> {
@@ -226,26 +284,8 @@ export async function buildLinkPreview(
         (await timed('load', async () =>
           ((await import('link-preview-js')) as unknown as { getLinkPreview: NonNullable<LinkPreviewDeps['getLinkPreview']> })
             .getLinkPreview))
-      const info = (await timed('page', () => getLinkPreview(url, {
-        timeout: opts.pageTimeoutMs,
-        followRedirects: 'manual',
-        // Same-host redirects only (http→https, www, trailing path) — and each hop re-checked below.
-        handleRedirects: (base: string, forwarded: string) => {
-          try {
-            const b = new URL(base).hostname
-            const f = new URL(forwarded).hostname
-            return f === b || f === 'www.' + b || 'www.' + f === b
-          } catch {
-            return false
-          }
-        },
-        resolveDNSHost: async (u: string) => {
-          const addr = await resolveHost(new URL(u).hostname)
-          if (isPrivateAddress(addr)) throw new Error('refused: private address')
-          return addr
-        },
-        headers: { 'user-agent': BROWSER_UA, 'accept-language': 'en-US,en;q=0.8' },
-      }))) as { url?: string; title?: string; description?: string; images?: string[]; mediaType?: string } | undefined
+      const info = (await timed('page', () => fetchPageWithRedirects(url, getLinkPreview, resolveHost, opts.pageTimeoutMs))) as
+        { url?: string; title?: string; description?: string; images?: string[]; mediaType?: string } | undefined
 
       if (!info || !info.title) return null
       const preview: BuiltLinkPreview = {

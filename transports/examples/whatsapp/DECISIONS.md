@@ -181,3 +181,24 @@ now get their cursors at push time like any other. The link-preview work is outb
 **Not part of this change** (live-only and deliberately left out): the pairing-prompt `label` / `inputType`
 fields — the contract does not define them. No wire/contract change (no `CONTRACT_VERSION` bump): the
 persisted `cursor-state.json` shape is unchanged.
+
+---
+
+## Link previews follow cross-host redirects (≤ 5 hops), every hop guarded
+
+Some sites send a bare host to another public host (`www.cnn.com` → `edition.cnn.com`). The preview
+fetcher used to follow only same-host redirects (http→https, `www`), so those links went out as plain
+text with no card.
+
+**Rule.** A page redirect is followed to a different public host, at most `MAX_REDIRECTS = 5` times
+(the first request does not count; a 6th redirect is refused and the message goes out as plain text).
+**Every hop is re-checked before it is requested**: http(s) only, no `localhost` / `.local` / `.internal`
+names, and the resolved address must not be private, loopback or link-local (metadata addresses
+included). A redirect loop simply runs into the cap. The 8 s page budget is shared by all hops.
+
+**How.** `link-preview-js` 3.2.0 follows at most one hop itself, so `fetchPageWithRedirects` runs the
+chain: the library's `handleRedirects` records the (already absolute) `Location` target and returns
+`false`, which stops the library; the loop re-checks the target and starts a fresh `getLinkPreview`
+on it. The thumbnail URL of the final page keeps its own separate private-address guard.
+
+Not changed: the send path, the thumbnail rules and the never-throws / never-delays guarantees.
