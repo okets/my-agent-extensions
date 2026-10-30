@@ -82,6 +82,7 @@ import {
 // "up" (CRIES-WOLF affordance). `wsReadyStateFromClient` maps Baileys rc13's `sock.ws` getters
 // (isOpen/isClosing/isClosed) to a WS_* readyState (the raw `sock.ws.readyState` is dead on rc13).
 import { computeUpstreamHealth, wsReadyStateFromClient, type HealthReason } from './health.js'
+import { pairingMethodPrompts } from './pairing-prompts.js'
 // Pure, dependency-free outbound send-routing decision (S1.3 (a)+(b)). Distinguishes an explicit
 // cert/echo run (loopback) from a LIVE send; a LIVE non-deliverable target is DROPPED loudly, never
 // echoed as fake inbound and never latches conformanceSeen (the live-poisoning fix).
@@ -151,7 +152,7 @@ type OnboardingArtifact =
   | { kind: 'code'; code: string; label?: string; instructions?: string }
   | { kind: 'status'; state: 'waiting' | 'linked' | 'expired' | 'error' | 'preflight_ok' | 'preflight_rejected'; detail?: string; registered?: boolean }
   | { kind: 'image'; handle: MediaHandle; label?: string }
-  | { kind: 'prompt'; text: string; secretKey?: string }
+  | { kind: 'prompt'; text: string; secretKey?: string; label?: string; inputType?: 'text' | 'action' }
 
 // ── Mode / env ────────────────────────────────────────────────────────────────────────────
 const PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER
@@ -437,7 +438,8 @@ function emitOnboardingArtifact(): void {
 
 /** The current onboarding snapshot, in present-order (image, code, status). Empty slots dropped. */
 function onboardingSnapshot(): OnboardingArtifact[] {
-  const arts: OnboardingArtifact[] = []
+  // Before a method is picked, declare the two pairing methods as prompts (label + inputType).
+  const arts: OnboardingArtifact[] = pairingMethodPrompts({ hasImage: !!onboardImage, hasCode: !!onboardCode, status: onboardStatus.state })
   if (onboardImage) arts.push(onboardImage)
   if (onboardCode) arts.push(onboardCode)
   arts.push(onboardStatus)

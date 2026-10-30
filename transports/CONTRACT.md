@@ -355,6 +355,19 @@ nobody is looking at; mint a fresh one **when the user asks**, regenerating if t
   (e.g. Baileys' 515 `restartRequired`) MUST reconnect immediately to finish the link; that is finishing
   pairing, not background cycling.
 
+### Onboarding artifact shapes (`transport/onboarding_poll` → `{artifacts:[...]}`)
+Each artifact is `{kind: 'code' | 'status' | 'image' | 'prompt', ...}`; the poll is the truth, the
+notification is only a wakeup. A `prompt` artifact declares a pairing method the user can pick:
+`{kind:'prompt', text, secretKey?, label?, inputType?}`.
+
+- `label` — **OPTIONAL.** A short display name for the method (e.g. "Phone Number", "QR Code").
+- `inputType` — **OPTIONAL**, `'text'` or `'action'`. `'text'` (the default when absent) means the method
+  needs the user to type a value first (e.g. a phone number); `'action'` means selecting the method starts
+  pairing immediately, with no further input (e.g. a QR button).
+
+Both are additive and optional: a connector that omits them is fully valid, and a frontend that ignores
+them still works (they only improve how the picker renders). Unknown values are dropped by the framework.
+
 ## Pairing correctness (QR / code transports)
 Hard-won rules — see [`references/pairing-pitfalls.md`](references/pairing-pitfalls.md) for the full
 worked example and evidence. Every QR/code connector MUST:
