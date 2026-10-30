@@ -63,6 +63,7 @@ import qrcodePkg from 'qrcode'
 import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, promises as fsp } from 'node:fs'
 import { join, isAbsolute } from 'node:path'
 import { InboundCatchup } from './offline-catchup.js'
+import { CursorQueue } from './cursor-queue.js'
 // Pure, dependency-free close-code policy (B1). The reconnect verdict lives here so it is unit-tested
 // without the folder-local node_modules; this file performs the side-effects of its decision.
 import { decideClose, closeHealthReason } from './close-policy.js'
@@ -276,11 +277,10 @@ function degradeContent(kind: string, caption: string): string {
 // PERSISTENT CURSOR: a push socket has no provider offset to anchor on, so a reset-to-zero counter
 // would let a post-restart message collide below the framework's sinceCursor and vanish.
 // cursorSeq + the bounded `seen` dedup are persisted to STATE_FILE across restarts.
-let backlog: WireInbound[] = []
-let cursorSeq = 0
+// The queue itself (mint-at-push cursor, retained drained tail, stale re-anchor, inbound counters) is the
+// dependency-free CursorQueue in cursor-queue.ts; this file wires its persist / wakeup / log callbacks.
 let seen: string[] = []
 const seenSet = new Set<string>()
-const MAX_BACKLOG = 2000
 // Offline catch-up (messages.upsert type 'append'): watermark + bounded handled-id dedupe, persisted in
 // STATE_FILE alongside the cursor. See offline-catchup.ts.
 const inboundCatchup = new InboundCatchup()
@@ -299,17 +299,11 @@ const STATE_FILE = join(AUTH_DIR, 'cursor-state.json')
 function loadCursorState(): void {
   try {
     const raw = JSON.parse(readFileSync(STATE_FILE, 'utf8')) as { cursorSeq?: number; seen?: string[]; backlog?: WireInbound[]; inboundWatermarkMs?: number; handledIds?: string[] }
-    if (typeof raw.cursorSeq === 'number' && raw.cursorSeq >= 0) cursorSeq = raw.cursorSeq
+    // cursorSeq (the high-water) is restored independently of the backlog, so a truncated backlog can't
+    // lower the next cursor (see CursorQueue.restore).
+    inboundQueue.restore(raw)
     inboundCatchup.restore(raw)
     if (Array.isArray(raw.seen)) { seen = raw.seen.slice(-1000); for (const id of seen) seenSet.add(id) }
-    if (Array.isArray(raw.backlog)) {
-      // Reload only entries the framework has NOT yet drained past (cursor > 0) and never above the
-      // cap. cursorSeq (high-water) is restored independently above, so a truncated backlog can't
-      // lower the next cursor.
-      backlog = raw.backlog
-        .filter((m): m is WireInbound => !!m && typeof (m as WireInbound).cursor === 'string')
-        .slice(-MAX_BACKLOG)
-    }
   } catch { /* first run / no state — start at 0 */ }
 }
 
@@ -323,43 +317,29 @@ function persistCursorState(): void {
     // Atomic (temp + rename): a respawn must never read a half-written / truncated state file — a torn
     // cursor-state would itself manufacture inbound loss.
     const tmp = STATE_FILE + '.tmp'
-    writeFileSync(tmp, JSON.stringify({ cursorSeq, seen: seen.slice(-1000), backlog, ...inboundCatchup.snapshot() }))
+    writeFileSync(tmp, JSON.stringify({ ...inboundQueue.snapshot(), seen: seen.slice(-1000), ...inboundCatchup.snapshot() }))
     renameSync(tmp, STATE_FILE)
   } catch { /* best-effort */ }
 }
 
-function nextCursor(): string {
-  cursorSeq += 1
-  return String(cursorSeq)
+/** The inbound queue. Cursors are minted INSIDE enqueue(), at push time (contract Cursor rule 1) — no
+ *  caller allocates one, so an await between event arrival and the push can never reorder cursors. */
+const inboundQueue = new CursorQueue<WireInbound>({
+  persist: persistCursorState,
+  notify: () => { void mcp.notification({ method: MESSAGE_AVAILABLE, params: {} }).catch(() => {}) },
+  warn: (message) => console.warn(`[whatsapp] ${message}`),
+  // Test-only drill switch (see CursorQueue.enqueue). Off unless the env var is exactly '1'; never set in
+  // production; same convention as SELFHEAL_WATCHDOG_OFF.
+  shouldDropInbound: () => process.env.SELFHEAL_DROP_INBOUND === '1',
+})
+
+function enqueue(entry: Omit<WireInbound, 'cursor'>): void {
+  inboundQueue.enqueue(entry)
 }
 
-function enqueue(entry: WireInbound): void {
-  backlog.push(entry)
-  if (backlog.length > MAX_BACKLOG) {
-    // Hitting the hard cap means the framework hasn't drained for MAX_BACKLOG messages — the evicted
-    // (oldest) entries are UN-ACKED inbound being dropped. This is the one residual silent-loss path
-    // on this connector, so make it LOUD (→stderr→journal) rather than a silent splice.
-    const dropped = backlog.length - MAX_BACKLOG
-    console.warn(`[whatsapp] BACKLOG CAP HIT — dropping ${dropped} un-drained inbound message(s); framework has not drained in >${MAX_BACKLOG} — possible inbound loss`)
-    backlog.splice(0, dropped)
-  }
-  persistCursorState()
-  void mcp.notification({ method: MESSAGE_AVAILABLE, params: {} }).catch(() => {})
-}
-
-/** All backlog entries with cursor > sinceCursor, oldest-first. NON-consuming for the RETURNED set,
- *  but GC-reclaiming: entries at/below `sinceCursor` have been acked by the framework advancing its
- *  durable cursor past them, so they are dropped from the persisted backlog (the bound). */
+/** All backlog entries with cursor > sinceCursor, oldest-first (non-consuming for the returned set). */
 function drain(sinceCursor: string | null): WireInbound[] {
-  const after = sinceCursor != null ? Number(sinceCursor) : 0
-  const out = backlog.filter((m) => Number(m.cursor) > after).sort((a, b) => Number(a.cursor) - Number(b.cursor))
-  // GC: reclaim everything the framework has already drained (cursor <= sinceCursor). Idempotent — a
-  // repeated drain at the same cursor is a no-op. Only persist when something was actually reclaimed.
-  if (after > 0) {
-    const kept = backlog.filter((m) => Number(m.cursor) > after)
-    if (kept.length !== backlog.length) { backlog = kept; persistCursorState() }
-  }
-  return out
+  return inboundQueue.drain(sinceCursor)
 }
 
 // ── getMessage store (for Baileys getMessage / inbound edit processing) ───────────────────────
@@ -623,6 +603,10 @@ async function handleUpsert(upsert: BaileysEventMap['messages.upsert']): Promise
     console.warn(`[whatsapp] offline catch-up: delivering ${catchup.count} message(s) that arrived while disconnected (oldest ${new Date(catchup.oldestMs).toISOString()})`)
   }
   for (const msg of deliver) {
+    // inboundReceived = raw provider events handed to ingest (live notify + accepted catch-up append);
+    // inboundEnqueued is counted inside the queue. Their divergence is what the framework's silent-drop
+    // net watches (transport/health).
+    inboundQueue.noteReceived()
     try {
       // Cache the raw message content (BOTH inbound and our own) so Baileys' getMessage can fetch the
       // ORIGINAL when it later processes a received MESSAGE_EDIT — otherwise the edit is dropped.
@@ -634,7 +618,6 @@ async function handleUpsert(upsert: BaileysEventMap['messages.upsert']): Promise
       const from = msg.key?.fromMe ? undefined : remoteJid
       if (from) {
         enqueue({
-          cursor: nextCursor(),
           from,
           content: degradeContent('media', ''),
           timestamp: Date.now(),
@@ -662,8 +645,9 @@ async function ingestMessage(msg: WAMessage): Promise<void> {
   if (!m) return
   // Record the Baileys message key so the onMarkRead hook (transport/mark_read) can look it up later.
   rememberInboundKey(providerMessageId, msg.key)
+  // NO cursor here — enqueue() mints it at push time (contract Cursor rule 1; see CursorQueue). Anything
+  // awaited below (media downloads) therefore cannot let a later message overtake this one.
   const base = {
-    cursor: nextCursor(),
     from,
     timestamp,
     ...(providerMessageId ? { providerMessageId } : {}),
@@ -845,7 +829,6 @@ async function handleMessagesUpdate(updates: BaileysEventMap['messages.update'])
       seenSet.add(dedupId); seen.push(dedupId); if (seen.length > 1000) seen = seen.slice(-1000)
       rememberMessageText(targetId, newText)
       enqueue({
-        cursor: nextCursor(),
         from,
         content: newText,
         timestamp,
@@ -1347,7 +1330,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       // media handles JSON-only with ids INTACT (the images carry-fidelity probe matches on id) —
       // NO endpoint call, NO bytes: §1 holds and re-staging would change the id and fail the probe.
       enqueue({
-        cursor: nextCursor(),
         from: to,
         content,
         timestamp: Date.now(),
@@ -1534,11 +1516,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       lastDisconnectReason,
       connecting, // 2a.4 (3): the post-recycle / in-flight (re)connect window → transient, not recycle
     })
+    // OPTIONAL inbound self-report counters, additive to the never-lie upstream report (contract Cursor
+    // rule 3): the framework compares inboundEnqueued against what it drains.
+    const reportWithInbound = { ...report, ...inboundQueue.counters() }
     // Return BOTH structuredContent and a JSON text block (the framework reads structuredContent
     // first, then falls back to parsing the text block — SDK-shape resilient).
     return {
-      structuredContent: report as unknown as Record<string, unknown>,
-      content: [{ type: 'text', text: JSON.stringify(report) }],
+      structuredContent: reportWithInbound as unknown as Record<string, unknown>,
+      content: [{ type: 'text', text: JSON.stringify(reportWithInbound) }],
     }
   }
 

@@ -127,7 +127,10 @@ link and credentials persist to the folder-local `./auth` dir (gitignored).
   `notifications/transport/onboarding_artifact` (the interactive-onboarding wakeup). Never bytes on the
   wire (the QR image rides a `MediaHandle`, never bytes), never unprompted push.
 - **Cursor durability (zero-loss):** the in-memory cursor queue is connector-owned and monotonic;
-  `drain` is non-consuming; the framework's durable cursor is the source of truth.
+  `drain` is non-consuming; the framework's durable cursor is the source of truth. The cursor is minted
+  at push time inside `enqueue()` (contract Cursor rule 1), `drain` keeps a short tail of already-drained
+  entries, and a stale cursor high-water re-anchors loudly (`src/cursor-queue.ts`). `transport/health`
+  also carries the `inboundReceived` / `inboundEnqueued` counters the framework's silent-drop net reads.
 - **Backoff suppression:** transient drops re-open the socket (515 restart is Baileys' in-band
   re-pair signal); a true crash loop is the supervisor breaker's job.
 - **Roles are binding-derived:** `roles:` is the CEILING (`dedicated`, `personal`). The effective
