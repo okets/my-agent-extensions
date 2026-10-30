@@ -62,6 +62,7 @@ import { pino } from 'pino'
 import qrcodePkg from 'qrcode'
 import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, promises as fsp } from 'node:fs'
 import { join, isAbsolute } from 'node:path'
+import { InboundCatchup } from './offline-catchup.js'
 // Pure, dependency-free close-code policy (B1). The reconnect verdict lives here so it is unit-tested
 // without the folder-local node_modules; this file performs the side-effects of its decision.
 import { decideClose, closeHealthReason } from './close-policy.js'
@@ -280,6 +281,9 @@ let cursorSeq = 0
 let seen: string[] = []
 const seenSet = new Set<string>()
 const MAX_BACKLOG = 2000
+// Offline catch-up (messages.upsert type 'append'): watermark + bounded handled-id dedupe, persisted in
+// STATE_FILE alongside the cursor. See offline-catchup.ts.
+const inboundCatchup = new InboundCatchup()
 const STATE_FILE = join(AUTH_DIR, 'cursor-state.json')
 
 // S1.2 (D1) — DURABLE BACKLOG. Persisting only {cursorSeq, seen} loses an in-flight inbound message
@@ -294,8 +298,9 @@ const STATE_FILE = join(AUTH_DIR, 'cursor-state.json')
 
 function loadCursorState(): void {
   try {
-    const raw = JSON.parse(readFileSync(STATE_FILE, 'utf8')) as { cursorSeq?: number; seen?: string[]; backlog?: WireInbound[] }
+    const raw = JSON.parse(readFileSync(STATE_FILE, 'utf8')) as { cursorSeq?: number; seen?: string[]; backlog?: WireInbound[]; inboundWatermarkMs?: number; handledIds?: string[] }
     if (typeof raw.cursorSeq === 'number' && raw.cursorSeq >= 0) cursorSeq = raw.cursorSeq
+    inboundCatchup.restore(raw)
     if (Array.isArray(raw.seen)) { seen = raw.seen.slice(-1000); for (const id of seen) seenSet.add(id) }
     if (Array.isArray(raw.backlog)) {
       // Reload only entries the framework has NOT yet drained past (cursor > 0) and never above the
@@ -318,7 +323,7 @@ function persistCursorState(): void {
     // Atomic (temp + rename): a respawn must never read a half-written / truncated state file — a torn
     // cursor-state would itself manufacture inbound loss.
     const tmp = STATE_FILE + '.tmp'
-    writeFileSync(tmp, JSON.stringify({ cursorSeq, seen: seen.slice(-1000), backlog }))
+    writeFileSync(tmp, JSON.stringify({ cursorSeq, seen: seen.slice(-1000), backlog, ...inboundCatchup.snapshot() }))
     renameSync(tmp, STATE_FILE)
   } catch { /* best-effort */ }
 }
@@ -611,8 +616,13 @@ async function flushCredSaves(): Promise<void> {
 
 // ── Inbound mapping (ported + extended from plugin.ts messages.upsert) ──────────────────────
 async function handleUpsert(upsert: BaileysEventMap['messages.upsert']): Promise<void> {
-  if (upsert.type !== 'notify') return
-  for (const msg of upsert.messages) {
+  // `notify` = live; `append` = offline catch-up replayed on reconnect (filtered by watermark / dedupe /
+  // real-content — see offline-catchup.ts). Anything else is not inbound.
+  const { deliver, catchup } = inboundCatchup.select(upsert)
+  if (catchup) {
+    console.warn(`[whatsapp] offline catch-up: delivering ${catchup.count} message(s) that arrived while disconnected (oldest ${new Date(catchup.oldestMs).toISOString()})`)
+  }
+  for (const msg of deliver) {
     try {
       // Cache the raw message content (BOTH inbound and our own) so Baileys' getMessage can fetch the
       // ORIGINAL when it later processes a received MESSAGE_EDIT — otherwise the edit is dropped.
@@ -633,7 +643,9 @@ async function handleUpsert(upsert: BaileysEventMap['messages.upsert']): Promise
       }
       console.warn(`[whatsapp] ingest error: ${e instanceof Error ? e.message : String(e)}`)
     }
+    inboundCatchup.markHandled(msg) // after the commit, so the watermark never runs ahead of the backlog
   }
+  if (deliver.length > 0) persistCursorState()
 }
 
 async function ingestMessage(msg: WAMessage): Promise<void> {
@@ -877,6 +889,7 @@ async function startSocket(): Promise<void> {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
     saveCredsFn = saveCreds
     const version = await getWaVersion()
+    inboundCatchup.armForConnect(Date.now()) // snapshot the offline catch-up floor for THIS socket
     // A NEW socket is opening: reset the per-socket pairing-code flag so THIS socket re-requests a
     // pairing code alongside its first QR (QR + code bound to one socket generation). Without this,
     // a fresh socket after a prior window would surface a rotating QR but inherit the OLD code.

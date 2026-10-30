@@ -115,3 +115,26 @@ that apply. Applies to `transport/send` and `transport/edit`; echo/cert mode nev
   tool calls (typing, reactions, drain) are not blocked; two back-to-back replies could in theory be
   reordered if the first waits on a slow preview — not guarded.
 - No wire/contract change (no `CONTRACT_VERSION` bump).
+## Offline catch-up — `messages.upsert` type `append` is delivered, not dropped
+
+The connector used to keep only `messages.upsert` events of `type === 'notify'` (live). Baileys replays
+messages that arrived **while the connector was disconnected** with `type === 'append'`, so anything sent
+to the agent's number during a disconnect was silently dropped — against the contract's "never silently
+drop inbound" rule.
+
+`append` messages are now delivered when they are (a) not `fromMe`, (b) real inbound content (not a
+protocol / key-distribution / stub / `status@broadcast` entry), (c) not older than a **floor**, and
+(d) not already handled (bounded id dedupe). `notify` is unchanged. Policy lives in the dependency-free
+`src/offline-catchup.ts` (tested by `src/offline-catchup.test.ts`); `server.ts` only wires it.
+
+- **Watermark** = timestamp of the newest inbound the connector handled, persisted in `cursor-state.json`
+  (the same atomically-written file as the cursor and backlog) together with the bounded handled-id list.
+- **Floor is a connect-time snapshot** of the watermark, not the live value: a live `notify` that lands
+  before the catch-up batch would otherwise advance the watermark past the older offline messages and
+  hide them. Id dedupe is what prevents double delivery within a session. Comparison is `>=` (whole
+  seconds) so a same-second sibling of the watermark message survives.
+- **First run (no watermark)**: accept only `append` messages from the last **15 minutes** since connect —
+  far wider than the 30 s reconnect backoff cap and a supervisor/deploy restart, narrow enough that a
+  first-link history replay does not surface stale conversations.
+- One log line per catch-up batch: count + oldest timestamp.
+- No wire/contract change (no `CONTRACT_VERSION` bump): same `WireInbound` entries, same `enqueue()`.
