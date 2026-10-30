@@ -70,6 +70,14 @@ source of truth, so the retained bounded backlog is zero-loss across a re-drain.
   dialect (single-char markers `*bold*` `_italic_` `~strike~` `` `code` ``; raw URLs, no anchor text,
   no tables) and hands the connector the rendered wire text. The connector sends it VERBATIM via
   `sock.sendMessage(to, {text})`.
+- **Link previews (outbound).** When a sent (or edited) text contains a URL, `src/link-preview.ts`
+  builds a rich preview — title, description and a small JPEG thumbnail (192 px, via `sharp`) — with
+  `link-preview-js` 3.2.0 and passes it to Baileys as `linkPreview`. 8 s page timeout, 4 s thumbnail
+  budget, 10 s hard ceiling on the whole build. Degrades in steps: slow/failed thumbnail → card with
+  title+description and no picture; page not done by the ceiling → plain text. Every fallback log line
+  carries per-stage timings (`load`/`page`/`imageDns`/`imageDownload`/`sharp`) and names the stage still
+  running. Private/loopback hosts are refused (SSRF guard, also on every redirect hop and the thumbnail
+  URL); a send is never failed by a preview. Echo/cert mode never fetches.
 - **Typing indicator** (`transport/typing` → `sendPresenceUpdate('composing'|'paused')`, refreshed
   every 4 s under WhatsApp's ~5 s auto-expire; a send to the chat clears it).
 - **Liveness** — the framework's heartbeat sweep pings the MCP server; the connector answers.

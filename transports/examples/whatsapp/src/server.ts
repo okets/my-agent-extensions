@@ -54,6 +54,7 @@ import baileysPkg, {
   type WASocket,
   type BaileysEventMap,
   type WAMessage,
+  type AnyMessageContent,
 } from '@whiskeysockets/baileys'
 import { pino } from 'pino'
 // `qrcode` ships no bundled types; it is used in LIVE mode only to render Baileys' scannable QR
@@ -84,6 +85,8 @@ import { computeUpstreamHealth, wsReadyStateFromClient, type HealthReason } from
 // cert/echo run (loopback) from a LIVE send; a LIVE non-deliverable target is DROPPED loudly, never
 // echoed as fake inbound and never latches conformanceSeen (the live-poisoning fix).
 import { decideSendRoute } from './send-policy.js'
+// Outbound link previews (built here, not by Baileys: timeouts, private-address refusal, no-picture step-down).
+import { buildLinkPreview, extractFirstUrl, warmLinkPreview } from './link-preview.js'
 
 // CJS interop: `qrcode`'s API lands on `.default` under ESM. Narrow to just the `toBuffer` we use.
 const qrcode = ((qrcodePkg as unknown as { default?: unknown }).default ?? qrcodePkg) as {
@@ -1306,6 +1309,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }))
 
+/**
+ * Outbound text content with its link preview attached (see link-preview.ts). Text without a URL is
+ * returned untouched. With a URL, `linkPreview` is the built preview or `null` (plain text) — never
+ * throws, never waits longer than the preview timeout.
+ */
+async function withLinkPreview(content: string): Promise<AnyMessageContent> {
+  if (!extractFirstUrl(content)) return { text: content }
+  const preview = await buildLinkPreview(content)
+  return { text: content, linkPreview: preview } as AnyMessageContent
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (req.params.name === SEND_TOOL) {
     const { to, content, media } = req.params.arguments as { to: string; content: string; media?: MediaHandle[] }
@@ -1344,10 +1358,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     // content arrives ALREADY RENDERED for the whatsapp dialect (*bold* _italic_ ~strike~ `code`) —
     // send VERBATIM. A pure-media reply arrives with empty content → skip the blank text bubble.
     if (content && content.length > 0) {
-      // Baileys builds a link preview for any text with a URL through the optional peer dependency
-      // `link-preview-js`. We do not install that, so every send with a link logged "url generation failed".
-      // `linkPreview: null` skips it; messages are sent exactly as before, without a preview card.
-      const result = await sock.sendMessage(to, { text: content, linkPreview: null })
+      // Link preview: when the text carries a URL, build the preview OURSELVES (short timeout, private-
+      // address guard, sharp thumbnail) and pass it explicitly. `null` = no preview → plain text, never
+      // blocks longer than the preview timeout. Passing it (even null) stops Baileys' own uncapped fetch.
+      const result = await sock.sendMessage(to, await withLinkPreview(content))
       messageId = result?.key?.id ?? undefined
       // Remember our own outbound text so a reaction to THIS reply resolves to a snippet, and cache
       // the sent message so getMessage can resolve an edit of it.
@@ -1391,7 +1405,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const { to, messageId, content } = req.params.arguments as { to: string; messageId: string; content: string }
     if (!ECHO_MODE && isDeliverableTarget(to) && sock) {
       try {
-        await sock.sendMessage(to, { text: content, linkPreview: null, edit: { remoteJid: to, id: messageId, fromMe: true } })
+        await sock.sendMessage(to, { ...(await withLinkPreview(content)), edit: { remoteJid: to, id: messageId, fromMe: true } } as AnyMessageContent)
       } catch (e) {
         console.warn(`[whatsapp] edit failed: ${e instanceof Error ? e.message : String(e)}`)
       }
@@ -1543,6 +1557,7 @@ process.on('SIGTERM', () => {
 await mcp.connect(new StdioServerTransport())
 
 if (!ECHO_MODE && !CONFORMANCE_ENV) {
+  void warmLinkPreview() // pre-load link-preview-js + sharp so the first preview skips the cold start (never throws)
   // S1.3 (a): skip the live connect entirely under the explicit cert env (TRANSPORT_CONFORMANCE) —
   // a recert over a registered folder (ECHO_MODE=false) is a cert run, never a live session, so it
   // must open NO real socket. (conformanceSeen still disarms the timer below as a second belt.)
