@@ -138,3 +138,46 @@ protocol / key-distribution / stub / `status@broadcast` entry), (c) not older th
   first-link history replay does not surface stale conversations.
 - One log line per catch-up batch: count + oldest timestamp.
 - No wire/contract change (no `CONTRACT_VERSION` bump): same `WireInbound` entries, same `enqueue()`.
+
+## Cursor minted at push time, drained tail retained, inbound counted
+
+**The bug.** `ingestMessage` allocated a cursor before it awaited a media download, and the offline
+catch-up path (and the edit / reaction paths) did the same with `nextCursor()` at the call site. A faster
+message arriving later could take a higher cursor and be pushed first; the framework then advanced
+`sinceCursor` past the slower message's lower cursor, and when the slow message was finally pushed it was
+permanently undrainable (`drain` returns `cursor > sinceCursor`). That is a silent inbound loss — the
+contract's Cursor rule 1 (`transports/CONTRACT.md`) exists because it happened on a live WhatsApp account.
+
+**The fix, in one place.** The queue is now the dependency-free `src/cursor-queue.ts`
+(tested by `src/cursor-queue.test.ts`); `server.ts` wires its persist / wakeup / log callbacks.
+
+- `enqueue()` takes an entry **without** a cursor and mints it itself, synchronously with the push. There
+  is exactly one `nextCursor()` caller. Every inbound route (live `notify`, offline catch-up `append`,
+  edits, reactions, the cert echo, the ingest-error fallback) goes through it, so cursor order is push
+  order by construction; no call site can reintroduce the race.
+- `drain()` keeps the newest `RETAIN_DRAINED_TAIL` (64) already-drained entries instead of reclaiming them
+  the instant the framework acks them, so a re-drain from an older cursor (the cert harness's
+  temporal-contract probe, a second in-process reader) still returns everything above it. The returned set
+  is still strictly `cursor > sinceCursor` (no duplicates) and the persisted backlog stays bounded.
+- A drain whose `sinceCursor` is **ahead** of the persisted counter (a lost state write, then a restart)
+  re-anchors the counter to it with a loud warning (Cursor rule 4); otherwise every later enqueue would
+  mint below `sinceCursor` and vanish.
+- `transport/health` carries `inboundReceived` (raw events handed to ingest — live `notify` plus accepted
+  catch-up `append`) and `inboundEnqueued` (pushes to the drainable backlog), the pair the framework's
+  silent-drop net compares (Cursor rule 3).
+
+**`SELFHEAL_DROP_INBOUND=1` is a test-only drill switch.** When (and only when) the env var is exactly `1`,
+`enqueue()` counts the entry but does not store it, so the framework's "enqueued but never drainable" net
+can be proven live on demand. Nothing in the connector or the framework sets it; unset (the production
+default) it has no effect. Because it would swallow real inbound if someone did set it, the first swallowed
+entry logs one loud `SELFHEAL_DROP_INBOUND=1 — TEST SWITCH ACTIVE` line. A swallowed entry consumes no
+cursor. A pre-enqueue skip is deliberately **not** simulated: ordinary filtering looks identical and must
+never trip the recycle ladder.
+
+**Composition.** The offline catch-up policy (`offline-catchup.ts`) is unchanged: it still decides *which*
+`append` messages are delivered and `markHandled` still runs after the commit, but the delivered messages
+now get their cursors at push time like any other. The link-preview work is outbound-only and untouched.
+
+**Not part of this change** (live-only and deliberately left out): the pairing-prompt `label` / `inputType`
+fields — the contract does not define them. No wire/contract change (no `CONTRACT_VERSION` bump): the
+persisted `cursor-state.json` shape is unchanged.
