@@ -81,6 +81,40 @@ manifest; the lockfile was regenerated (`npm install`) so `package.json` + lock 
 was re-certified through the conformance CLI (STRUCTURALLY CERTIFIED, onboarding-handshake +
 pairing-adversarial probes PASS).
 
+## Outbound link previews — built by the connector, `link-preview-js` pinned 3.2.0
+
+Baileys builds a link preview for any outgoing text containing a URL through its optional peer
+dependency `link-preview-js`. Left to itself that fetch has no tight timeout, no private-address guard,
+and (when the package is missing) logs "url generation failed" on every send with a link. The connector
+now builds the preview itself and passes it to `sendMessage` explicitly — an object, or `null` for plain
+text. Passing the field at all, even `null`, stops Baileys' own fetch, so the rules below are the ones
+that apply. Applies to `transport/send` and `transport/edit`; echo/cert mode never fetches.
+
+- **Code.** `src/link-preview.ts` (the builder; unit-tested without network by `src/link-preview.test.ts`)
+  and `withLinkPreview()` in `src/server.ts`, which returns `{ text }` untouched when there is no URL.
+  `link-preview-js` and `sharp` are imported lazily; `warmLinkPreview()` pre-loads both at start so the
+  first preview skips the cold start.
+- **Dependency.** `link-preview-js` is pinned **exactly `3.2.0`** in `package.json` (lockfile regenerated;
+  it brings `cheerio` 1.0.0-rc.11 and `url` as transitive deps). Exact, because the builder passes
+  options (`handleRedirects`, `resolveDNSHost`, `followRedirects: 'manual'`) whose behaviour is the
+  safety net, and a floating minor could change them silently; Baileys' own peer range is `^3.0.0`, which
+  3.2.0 satisfies. `sharp` is not a new dependency: it is Baileys' peer and already resolved in the
+  lockfile.
+- **Never blocks or fails a send.** The build never throws and has a hard 10 s ceiling (page 8 s,
+  thumbnail 4 s and never past the ceiling). Any failure resolves to plain text.
+- **Step-down, in order.** Slow or failed thumbnail → card with title and description, no picture. Ceiling
+  reached after the page stage finished → the same no-picture card. Page stage unfinished → plain text.
+- **Private-address refusal.** Only public http(s) hosts are fetched: loopback, private, link-local,
+  unique-local, unspecified and `.local`/`.internal`/`localhost` names are refused — on the first URL,
+  on every redirect hop (same-host redirects only: http→https, `www.`) and on the thumbnail URL. The
+  thumbnail download is capped at 3 MB and re-encoded to a 192 px JPEG.
+- **Per-stage timing log.** Every fallback line carries `load` / `page` / `imageDns` / `imageDownload` /
+  `sharp` timings and names the stage still running when a deadline hit, so a slow preview is
+  diagnosable from the log alone.
+- **Known limit.** A message with a URL waits up to the ceiling for its preview before it is sent. Other
+  tool calls (typing, reactions, drain) are not blocked; two back-to-back replies could in theory be
+  reordered if the first waits on a slow preview — not guarded.
+- No wire/contract change (no `CONTRACT_VERSION` bump).
 ## Offline catch-up — `messages.upsert` type `append` is delivered, not dropped
 
 The connector used to keep only `messages.upsert` events of `type === 'notify'` (live). Baileys replays
